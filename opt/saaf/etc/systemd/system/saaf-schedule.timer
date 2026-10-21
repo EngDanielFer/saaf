@@ -1,0 +1,9 @@
+[Unit]
+Description=Corre saaf-schedule.service todos los dias a las 3am
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

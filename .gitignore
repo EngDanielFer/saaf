@@ -1,0 +1,65 @@
+# =============================================================
+# SAAF Pro — .gitignore
+# Raíz del repositorio: proyecto_saaf/
+# =============================================================
+ 
+# --- Secretos y credenciales (NUNCA versionar) -----------------
+# enh_secrets.json guarda la contraseña de WordPress y el webhook de Teams
+.env
+*.env
+!*.env.example
+opt/saaf/config/enh_secrets.json
+enh_secrets.json
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+credentials*.json
+ 
+# --- Dependencias (se reinstalan) ------------------------------
+node_modules/
+venv/
+.venv/
+env/
+ 
+# --- Python ----------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+ 
+# --- Datos generados en ejecución ------------------------------
+# Base de datos SQLite (contiene resultados de auditorías)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+ 
+# Logs (incluye saaf.log, scheduler.log, app.log, enhancements.log)
+logs/
+*.log
+ 
+# Reportes y salidas generadas
+*.pdf
+*.tmp
+*.bak
+*.swp
+*~
+ 
+# --- Streamlit -------------------------------------------------
+.streamlit/secrets.toml
+ 
+# --- Editores y sistema operativo ------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini

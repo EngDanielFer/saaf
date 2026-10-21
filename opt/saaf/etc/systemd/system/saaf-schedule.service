@@ -1,0 +1,10 @@
+[Unit]
+Description=SAAF Pro - Ejecucion diaria de schedule.py
+After=network.target
+
+[Service]
+Type=oneshot
+User=admin_ubuntu
+WorkingDirectory=/home/admin_ubuntu/Desktop/proyecto_saaf
+EnvironmentFile=/home/admin_ubuntu/Desktop/proyecto_saaf/opt/saaf/config/saaf.env
+ExecStart=/home/admin_ubuntu/Desktop/proyecto_saaf/venv/bin/python3 /home/admin_ubuntu/Desktop/proyecto_saaf/schedule.py

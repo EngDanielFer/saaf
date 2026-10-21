@@ -1,0 +1,15 @@
+[Unit]
+Description=SAAF Pro Security Audit Bot
+After=network.target
+
+[Service]
+Type=simple
+User=admin_ubuntu
+WorkingDirectory=/home/admin_ubuntu/Desktop/proyecto_saaf/opt/saaf
+ExecStart=saaf-start.sh
+Restart=on-failure
+RestartSec=60
+EnvironmentFile=/home/admin_ubuntu/Desktop/proyecto_saaf/opt/saaf/config/saaf.env
+
+[Install]
+WantedBy=multi-user.target

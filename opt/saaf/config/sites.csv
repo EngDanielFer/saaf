@@ -1,0 +1,6 @@
+name,url,sitemap_url,niche,priority,active
+Mi Blog Principal,https://miblog.com,https://miblog.com/sitemap.xml,blog,high,true
+Tienda Online,https://tienda.com,https://tienda.com/sitemap_index.xml,ecommerce,high,true
+Sitio Corporativo,https://empresa.com,,corporate,normal,true
+Portal de Noticias,https://noticias.com,https://noticias.com/sitemap.xml,news,normal,true
+Landing Page,https://landing.com,,landing,low,false
