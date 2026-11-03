@@ -32,6 +32,30 @@ NON_TOPIC_CATEGORY = {
     "unexpected_language": "language",
     "external_link_review": "external_review",
 }
+# Huellas tipicas de cargadores de malware en JavaScript. Ninguna basta por si sola
+# (hay librerias legitimas con base64 o eval); sumadas indican un cargador malicioso.
+CODE_INDICATORS = (
+    ("evita_admin", re.compile(r"getElementById\(\s*['\"]wpadminbar['\"]\s*\)", re.I), 0.35,
+     "no se ejecuta si hay un administrador de WordPress conectado"),
+    ("anti_analisis", re.compile(r"\(\s*\+\s*new\s+Date\(\)\s*\)\s*-\s*\w+\s*>\s*\d+|Date\.now\(\)\s*-\s*\w+\s*>\s*\d+", re.I), 0.35,
+     "mide tiempos para evadir el análisis automático"),
+    ("cookie_control", re.compile(r"document\.cookie(\s*\|\|\s*(''|\"\"))?\s*\)?\.indexOf\(\s*['\"][A-Za-z0-9_\-]{4,}=['\"]\s*\)\s*!==?\s*-1\s*\)\s*return", re.I), 0.30,
+     "usa una cookie de control para ejecutarse una sola vez"),
+    ("decodificador_propio", re.compile(r"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\+/="), 0.30,
+     "incluye un decodificador base64 propio"),
+    ("ejecucion_dinamica", re.compile(r"\beval\s*\(|new\s+Function\s*\(|\bFunction\s*\(\s*['\"]", re.I), 0.25,
+     "ejecuta código construido dinámicamente"),
+    ("cadenas_codificadas", re.compile(r"(\\x[0-9a-fA-F]{2}){6,}|(\\u[0-9a-fA-F]{4}){6,}"), 0.30,
+     "contiene cadenas codificadas en hexadecimal/unicode"),
+)
+
+
+def code_indicators(*texts) -> list:
+    """[(nombre, probabilidad, descripcion)] de las huellas de cargador malicioso halladas en los textos."""
+    blob = "\n".join(t for t in texts if t)
+    return [(n, p, d) for n, rx, p, d in CODE_INDICATORS if rx.search(blob)]
+
+
 # Tipos que la IA puede considerar LEGITIMOS (un script de un proveedor conocido
 # o un enlace externo coherente). El resto de tipos nunca se descarta por IA.
 LEGIT_ELIGIBLE_TYPES = {"external_script", "external_link_review"}
@@ -198,19 +222,47 @@ def classify_item(item: dict, niche: str = "", spam_domains=None, page_text_term
     ps = [topic_p] + [0.5] * len(strong_signals)
     if spam_domain_hit:
         ps.append(0.9)
+
+    # Huellas de codigo malicioso (solo en elementos que son codigo)
+    code_hits = []
+    if ttype in ("obfuscated_js", "external_script", "hidden_iframe") and item.get("source") != "language":
+        code_hits = code_indicators(item.get("snippet"), item.get("description"))
+        ps += [p for _, p, _ in code_hits]
+
+    # El motor original marco la URL de la PROPIA pagina por un patron, pero no hay terminos de spam:
+    # casi siempre es un articulo legitimo. Se informa con confianza baja, sin proponer acciones.
+    self_ref = False
+    if ttype == "casino_pharma_adult" and not terms and not strong_signals and not spam_domain_hit and item.get("resource_url"):
+        try:
+            self_ref = bool(get_host(item["resource_url"])) and get_host(item["resource_url"]) == get_host(item.get("page_url") or "")
+        except Exception:
+            self_ref = False
+
     if item.get("source") == "language":
         ps.append(0.45)  # idioma distinto al esperado: indicio, no prueba
     elif item.get("source") == "link_review":
         ps = [item.get("link_conf", 0.5) / 100.0, topic_p]
+    elif self_ref:
+        ps = [0.12]
     else:
         ps.append(0.6 * sev_p)  # la severidad que ya calculo el sistema pesa, pero no manda
 
     if cat is None:
-        cat = NON_TOPIC_CATEGORY.get(ttype, "other")
+        cat = "other" if self_ref else NON_TOPIC_CATEGORY.get(ttype, "other")
     p = tx.combine_prob(*ps)
 
-    indicators = [t for t in terms]
+    # Recurso externo sin ninguna evidencia de riesgo (solo la severidad base): no es un «script sospechoso»,
+    # es un recurso de terceros por revisar. Se separa para no diluir el porcentaje de los scripts realmente sospechosos.
+    if (cat == "scripts" and ttype in ("external_script", "hidden_iframe") and not terms and not strong_signals
+            and not spam_domain_hit and len(code_hits) < 2 and tx.pct(p) < 50):
+        cat = "external_review"
+
+    indicators = [t for t in terms] + [n for n, _, _ in code_hits]
     reason_bits = []
+    if code_hits:
+        reason_bits.append("el código " + "; ".join(d for _, _, d in code_hits[:3]))
+    if self_ref:
+        reason_bits.append("la URL de la propia página coincidió con un patrón pero no contiene términos de spam (posible falso positivo)")
     if terms:
         reason_bits.append("indicadores: " + ", ".join(sorted(terms)[:5]))
     if strong_signals:
@@ -226,12 +278,18 @@ def classify_item(item: dict, niche: str = "", spam_domains=None, page_text_term
         h_confidence=tx.pct(p),
         confidence=tx.pct(p),
         indicators=indicators,
+        # separados para poder redactarlos: los terminos se citan tal cual
+        # ("casino, bet, slot") y las huellas de codigo con su descripcion.
+        terms=sorted(terms),
+        code_notes=[d for _, _, d in code_hits],
         has_indicator=bool(
-            terms or strong_signals or spam_domain_hit or item.get("severity") in ("CRITICAL", "HIGH")
+            terms or strong_signals or spam_domain_hit or len(code_hits) >= 2
+            or (item.get("severity") in ("CRITICAL", "HIGH") and not self_ref)
             or item.get("source") == "language"
         ),
         # corroboracion deterministica fuerte (la IA sola no basta para corregir solo)
-        corroborated=bool(terms or strong_signals or spam_domain_hit or item.get("source") == "language"),
+        corroborated=bool(terms or strong_signals or spam_domain_hit or len(code_hits) >= 2
+                          or item.get("source") == "language"),
         reason="; ".join(reason_bits),
     )
     return item
@@ -247,7 +305,7 @@ def combine_with_ai(item: dict, ai_cat, ai_conf, ai_legit: bool = False):
       - sin corroboracion fuerte    -> tope 60 (la IA sola no corrige automaticamente).
     """
     h, h_cat = item["h_confidence"], item["h_category"]
-    generic = h_cat in ("injected_links", "scripts", "other")
+    generic = h_cat in ("injected_links", "scripts", "other", "external_review")
     if ai_cat in (None, ""):
         return
     ai_conf = max(0, min(100, int(ai_conf)))

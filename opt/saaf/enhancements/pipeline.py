@@ -16,6 +16,7 @@ import traceback
 from bs4 import BeautifulSoup
 
 from database import get_conn, get_site, get_spam_domains
+from url_utils import get_host
 
 from . import ai_context, config as cfgmod, distribution, history, items as itm, language, links as lk
 from . import remediation, reporting, store
@@ -61,6 +62,51 @@ def _language_items(site: dict, html_results: list, explicit: list, niche: str):
             if len(out) >= MAX_LANGUAGE_ITEMS:
                 break
     return out, expected
+
+
+# Tipos que un servicio declarado por la campania puede absolver. Nunca spam, enlaces ocultos ni JS ofuscado.
+TRUSTED_SERVICE_TYPES = {"external_script", "hidden_iframe"}
+
+
+def _host_matches(host: str, domains) -> bool:
+    host = (host or "").lower()
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def _apply_trusted_services(items: list, link_rows: list, trusted: list, spam_domains) -> int:
+    """Marca como validos los scripts/iframes cuyo dominio la campania declaro usar. Devuelve cuantos."""
+    n = 0
+    for it in items:
+        if it.get("legit") or it.get("threat_type") not in TRUSTED_SERVICE_TYPES or not it.get("resource_url"):
+            continue
+        host = get_host(it["resource_url"])
+        if not _host_matches(host, trusted) or _host_matches(host, spam_domains or []):
+            continue
+        # Con terminos de spam, huellas de codigo malicioso o señales fuertes NO se absuelve, aunque el dominio sea "declarado".
+        if it.get("indicators") or any(s.get("strong") for s in it.get("signals", [])):
+            continue
+        it.update(legit=True, legit_by="campaña", status="VALID",
+                  legit_reason="Servicio de terceros declarado por la campaña (" + host + ")")
+        n += 1
+    for r in link_rows:
+        if r["verdict"] == "review" and not r.get("hard_bad") and _host_matches(r["host"], trusted):
+            r.update(verdict="legit", reason="Servicio de terceros declarado por la campaña", source="campaña",
+                     confidence=95)
+    return n
+
+
+def _previous_summary(site_id: int, audit_id: int):
+    """Total de alertas y categorias del reporte anterior de la campaña (para comparar), o None."""
+    try:
+        with get_conn() as conn:
+            row = conn.execute("SELECT report FROM enh_reports WHERE site_id=? AND audit_id<? ORDER BY audit_id DESC LIMIT 1",
+                               (site_id, audit_id)).fetchone()
+        if not row:
+            return None
+        f = store.jload(row["report"], {}).get("facts", {})
+        return {"alerts": int(f.get("summary", {}).get("alerts", 0)), "groups": [g.get("key") for g in f.get("groups", [])]}
+    except Exception:
+        return None
 
 
 def _map_threat_ids(audit_id: int, items: list):
@@ -161,6 +207,11 @@ def run_after_audit(site: dict, site_id: int, audit_id: int, threats: list, html
             log.warning("Clasificación con IA falló: %s", e.__class__.__name__, exc_info=True)
             ai_info.update(classify_error="internal", classify_error_human="Error interno al usar la IA; se usó solo la heurística.")
 
+    # 4b) Servicios de terceros que la campania declara usar (decision humana, no depende de la IA)
+    trusted = site_cfg["ai"].get("trusted_services") or []
+    if trusted:
+        _apply_trusted_services(items, link_rows, trusted, spam_domains)
+
     # 5) Legitimos y enlaces por revisar
     legit_items = [i for i in items if i.get("legit")]
     items = [i for i in items if not i.get("legit")]
@@ -232,6 +283,10 @@ def run_after_audit(site: dict, site_id: int, audit_id: int, threats: list, html
                   "urls_analyzed": a["urls_analyzed"] if a else None}
     facts = reporting.build_facts(db_site, audit_meta, items, link_rows, link_summary, hist_result,
                                   rem_counters, expected_langs, ai_info, legit_items)
+    _prev = _previous_summary(site_id, audit_id)
+    if _prev:
+        facts["history"]["previous_alerts"] = _prev["alerts"]
+        facts["history"]["previous_groups"] = _prev["groups"]
     if ai_on and (facts["summary"]["alerts"] or facts["external_links"]["total"]):
         try:
             analysis = ai_context.write_analysis(facts)

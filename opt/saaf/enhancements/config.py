@@ -75,6 +75,7 @@ SITE_DEFAULTS = {
     "ai": {
         "expected_languages": [],     # [] = se infiere de la pagina de inicio
         "business_context": "",       # texto libre para la IA
+        "trusted_services": [],       # dominios de terceros que la campania declara usar (CRM, chat, analitica...)
         "threshold": None,            # None = usa el global
     },
     "wp": {
@@ -204,6 +205,7 @@ def normalize_site_config(cfg: dict) -> dict:
         langs = re.split(r"[,\s;]+", langs)
     a["expected_languages"] = sorted({l.strip().lower()[:2] for l in langs if l and l.strip()})
     a["business_context"] = (a.get("business_context") or "").strip()[:1000]
+    a["trusted_services"] = parse_domains(a.get("trusted_services"))
     t = a.get("threshold")
     a["threshold"] = None if t in (None, "") else _clamp_int(t, 0, 100, DEFAULT_THRESHOLD)
 
@@ -226,6 +228,22 @@ def parse_emails(value) -> list:
             seen.add(e.lower())
             out.append(e)
     return out
+
+
+def parse_domains(value, limit: int = 60) -> list:
+    """Texto/lista -> dominios en minusculas sin esquema, ruta ni www (maximo `limit`)."""
+    if isinstance(value, str):
+        value = re.split(r"[,;\s]+", value)
+    out, seen = [], set()
+    for d in value or []:
+        d = (d or "").strip().lower()
+        d = re.sub(r"^[a-z]+://", "", d).split("/")[0].split("?")[0].split(":")[0].lstrip("*.")
+        if d.startswith("www."):
+            d = d[4:]
+        if d and re.match(r"^[a-z0-9][a-z0-9.\-]*\.[a-z]{2,}$", d) and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out[:limit]
 
 
 def invalid_emails(value) -> list:

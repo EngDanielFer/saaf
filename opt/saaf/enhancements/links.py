@@ -140,7 +140,7 @@ def heuristic_verdicts(domains: dict, niche: str = "", spam_domains=None, site_u
             reason = "dominio institucional o plataforma conocida"
         else:
             p = 0.6
-            reason = "sin indicadores de riesgo (coherencia no verificada por IA)"
+            reason = "sin indicios de riesgo, pero su coherencia con el negocio no se ha verificado"
         rows.append(
             {
                 "host": reg,
@@ -190,14 +190,31 @@ def apply_ai_verdicts(rows: list, ai_links: list) -> int:
     return changed
 
 
+def is_confirmed(row: dict) -> bool:
+    """
+    Un dominio "legit" puede serlo por dos motivos muy distintos:
+      * CONFIRMADO: es institucional (.gov/.edu) o una plataforma conocida, lo
+        declaro la campania como servicio de terceros, o la IA lo juzgo coherente.
+      * NO VERIFICADO: simplemente no muestra indicios de riesgo. No es alerta,
+        pero decir que "es coherente con la actividad del sitio" seria inexacto.
+    """
+    return row["verdict"] == "legit" and (bool(row.get("trusted")) or row.get("source") in ("ia", "campaña"))
+
+
 def summarize(rows: list) -> dict:
     legit = [r for r in rows if r["verdict"] == "legit"]
     review = [r for r in rows if r["verdict"] == "review"]
+    confirmed = [r for r in legit if is_confirmed(r)]
+    unverified = [r for r in legit if not is_confirmed(r)]
     return {
         "domains": len(rows),
         "links": sum(r["links_count"] for r in rows),
-        "legit": len(legit),
+        "legit": len(legit),          # total que NO es alerta (confirmados + no verificados)
         "review": len(review),
+        "confirmed": len(confirmed),  # coherencia respaldada (institucional, declarado o IA)
+        "unverified": len(unverified),
         "legit_hosts": [r["host"] for r in legit],
         "review_hosts": [r["host"] for r in review],
+        "confirmed_hosts": [r["host"] for r in confirmed],
+        "unverified_hosts": [r["host"] for r in unverified],
     }

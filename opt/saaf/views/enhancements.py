@@ -38,6 +38,16 @@ def _esc(text) -> str:
     return _MD_SPECIAL.sub(r"\\\1", str(text or ""))
 
 
+def _box():
+    """Contenedor con borde. Streamlit < 1.29 no admite border=True: en ese caso, contenedor normal + línea."""
+    try:
+        return st.container(border=True)
+    except TypeError:
+        box = st.container()
+        box.markdown("---")
+        return box
+
+
 def _flash(kind: str = None, msg: str = None):
     """Mensaje que sobrevive a st.rerun()."""
     if kind:
@@ -55,9 +65,42 @@ def _site_picker(key: str, sites):
 
 
 # =============================================================
+# Funciones que cada modulo debe exponer: detecta archivos mal copiados (p. ej. dos módulos con el mismo contenido).
+_REQUIRED = {
+    "reporting": ("build_facts", "render_text", "render_html", "teams_payload", "defang", "SUMMARY_LINES"),
+    "remediation": ("process_items", "authorize", "reject", "revert", "list_remediations", "decide"),
+    "pipeline": ("run_after_audit", "get_report", "list_reports"),
+    "distribution": ("dispatch", "send_email", "send_teams", "test_teams"),
+    "history": ("apply_history", "STATE_LABEL"),
+    "schedule": ("tick", "start_ticker", "filter_sites_for_cycle"),
+    "links": ("heuristic_verdicts", "summarize", "is_confirmed"),
+    "items": ("classify_item", "code_indicators"),
+}
+
+
+def _integrity_problems() -> list:
+    bad = []
+    import importlib
+    for mod, names in _REQUIRED.items():
+        try:
+            m = importlib.import_module(f"enhancements.{mod}")
+        except Exception as e:  # noqa
+            bad.append(f"enhancements/{mod}.py no se puede cargar ({e.__class__.__name__})")
+            continue
+        missing = [n for n in names if not hasattr(m, n)]
+        if missing:
+            bad.append(f"enhancements/{mod}.py está incompleto o es otro archivo (falta: {', '.join(missing[:3])})")
+    return bad
+
+
 def render():
     init_db()
     st.markdown("## 🧠 Auditoría IA")
+    problems = _integrity_problems()
+    if problems:
+        st.error("Hay archivos del paquete mal copiados. Vuelve a copiar estos desde el paquete original y reinicia el dashboard:\n\n"
+                 + "\n".join("• " + p for p in problems))
+        return
     if cfgmod.killed():
         st.warning("Las mejoras están desactivadas por el interruptor SAAF_ENHANCEMENTS=0 en saaf.env.")
         return
@@ -134,6 +177,10 @@ def _tab_reports(sites):
                              for k, v in g["statuses"].items() if k)
             if sts:
                 st.caption(sts)
+            if g.get("terms"):
+                st.caption("Términos encontrados: " + _esc(", ".join(g["terms"])))
+            for note in g.get("code_notes") or []:
+                st.caption("Código: " + _esc(note))
             st.dataframe(
                 [{"Página": e["page"], "Recurso": reporting.defang(e["resource"]), "Confianza %": e["confidence"],
                   "Estado": history.STATE_LABEL.get(e["lifecycle"], e["lifecycle"] or ""),
@@ -146,15 +193,28 @@ def _tab_reports(sites):
     ext = f["external_links"]
     st.markdown("#### Enlaces externos")
     if ext["total"]:
-        st.write(f"Se analizaron **{ext['total']}** dominios externos: **{ext['legit']}** coherentes con la "
-                 f"actividad del sitio (registrados como válidos) y **{ext['review']}** requieren revisión.")
+        st.write(f"Se analizaron **{ext['total']}** dominios externos: **{ext['legit']}** no representan riesgo "
+                 f"(registrados como válidos) y **{ext['review']}** requieren revisión.")
         if ext["review_list"]:
             st.dataframe([{"Dominio": reporting.defang(r["host"]), "Motivo": r["reason"],
                            "Confianza %": r["confidence"], "Páginas": ", ".join(r["pages"])}
                           for r in ext["review_list"]], hide_index=True, use_container_width=True)
-        if ext["legit_hosts"]:
-            with st.expander("Dominios reconocidos como válidos"):
-                st.write(", ".join(reporting.defang(h) for h in ext["legit_hosts"]))
+        # Punto 2: se separa lo respaldado (institucional, declarado o juzgado por la IA)
+        # de lo que solo "no muestra indicios".
+        conf_hosts = ext.get("confirmed_hosts") or []
+        unv = ext.get("unverified_list") or []
+        if conf_hosts:
+            with st.expander(f"Coherentes con la actividad del sitio ({len(conf_hosts)})"):
+                st.caption("Dominios institucionales, plataformas conocidas, servicios declarados por la campaña "
+                           "o juzgados coherentes por la IA.")
+                st.write(", ".join(reporting.defang(h) for h in conf_hosts))
+        if unv:
+            with st.expander(f"Sin indicios de riesgo, pero sin verificar ({ext.get('unverified', len(unv))})"):
+                st.caption("No son alerta, pero su coherencia con el negocio no está respaldada. Si la campaña los "
+                           "usa, decláralos en Campañas → IA → «Servicios de terceros».")
+                st.dataframe([{"Dominio": reporting.defang(r["host"]), "Enlaces": r["links"],
+                               "Páginas": ", ".join(r["pages"])} for r in unv],
+                             hide_index=True, use_container_width=True)
     else:
         st.caption("No se encontraron enlaces externos.")
 
@@ -227,7 +287,7 @@ def _tab_authorizations():
         st.success("No hay correcciones pendientes de autorización.")
     for r in pend:
         label = cfgmod.ACTIONS.get(r["action"], {}).get("label", r["action"])
-        with st.container(border=True):
+        with _box():
             st.markdown(f"**{_esc(r['site_name'])}** — {label}  \n"
                         f"Página: `{r['target_url']}`" + (f"  \nRecurso: `{reporting.defang(r['resource_url'])}`" if r["resource_url"] else ""))
             st.caption(f"Confianza {r['confidence']}% (umbral {r['threshold']}%) · {_esc(r['message'])}")
@@ -375,10 +435,17 @@ def _tab_campaigns(sites):
             ctx = st.text_area("Contexto del negocio (ayuda a la IA a distinguir enlaces legítimos)",
                                value=ac["business_context"], max_chars=1000,
                                placeholder="Ej.: Empresa de cercas y cerramientos en Cali; enlaza a la Alcaldía y a entidades de permisos.")
+            trusted_txt = st.text_area(
+                "Servicios de terceros que esta campaña usa (un dominio por línea)",
+                value="\n".join(ac["trusted_services"]), height=110,
+                placeholder="bitrix24.com\nwsimg.com\nposthog.com",
+                help="Scripts e iframes de estos dominios se registran como «analizados y válidos» y no cuentan como alerta. "
+                     "No se aplica a dominios de la lista de spam, ni a elementos con indicadores de spam o de código malicioso.")
             own = st.checkbox("Usar un umbral de confianza propio para esta campaña", value=ac["threshold"] is not None)
             thr = st.slider("Umbral propio (%)", 0, 100, ac["threshold"] if ac["threshold"] is not None else cfgmod.get_global()["threshold"])
             if st.form_submit_button("Guardar"):
                 cfgmod.set_site_config(sid, {"ai": {"expected_languages": langs, "business_context": ctx,
+                                                     "trusted_services": trusted_txt,
                                                      "threshold": thr if own else None}})
                 _flash("success", "Configuración de IA guardada.")
                 st.rerun()

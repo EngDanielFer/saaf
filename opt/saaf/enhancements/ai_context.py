@@ -372,9 +372,86 @@ def _plural(n, one, many):
     return f"{n} {one if n == 1 else many}"
 
 
+def _join_and(items, n=3):
+    """a, b y c (sin repetidos, hasta n elementos)."""
+    items = list(dict.fromkeys(i for i in items if i))[:n]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " y " + items[-1]
+
+
 def _conf_word(c) -> str:
     c = int(c or 0)
     return "alta" if c >= 85 else "media" if c >= 60 else "baja"
+
+
+def _findings_sentence(g: dict) -> str:
+    """Que se encontro concretamente en un grupo: terminos, dominios y huellas de codigo."""
+    bits = []
+    if g.get("terms"):
+        bits.append(f"términos asociados a {_join_and(g['terms'], 4)}")
+    if g.get("hosts"):
+        hosts = _join_and(g["hosts"], 3)
+        bits.append(f"el dominio {hosts}" if len(g["hosts"]) == 1 else f"dominios como {hosts}")
+    if not bits:
+        return ""
+    txt = ", además de ".join(bits).replace("además de el ", "además del ")  # de + el = del
+    return f"Entre los hallazgos de «{g['label']}» aparecen {txt}."
+
+
+def _code_sentence(groups: list) -> str:
+    """Huellas de cargador malicioso encontradas en el codigo (lo mas grave que se puede detectar sin IA)."""
+    for g in groups:
+        if g.get("code_notes"):
+            ex = _join([e["page"] for e in g["examples"] if e.get("page")], 2)
+            return (f"El código revisado{f' en {ex}' if ex else ''} "
+                    f"{_join_and(g['code_notes'], 3)}, un comportamiento propio de un cargador malicioso "
+                    f"y no de un script legítimo.")
+    return ""
+
+
+def _pattern_sentence(groups: list) -> str:
+    """Varias alertas en varias paginas que comparten termino u origen: probablemente una sola inyeccion."""
+    for i, g in enumerate(groups):
+        if not g.get("same_pattern"):
+            continue
+        # Si es el grupo principal, sus paginas ya se citaron en la frase anterior.
+        quien = "Estos elementos" if i == 0 else f"Los elementos de «{g['label']}»"
+        donde = f"están repartidos en {_plural(g['pages'], 'página', 'páginas distintas')}"
+        if i != 0:
+            ex = _join([e["page"] for e in g["examples"] if e.get("page")], 3)
+            donde += f" ({ex})" if ex else ""
+        return (f"{quien} {donde} y comparten los mismos indicadores, lo que indica que probablemente "
+                f"pertenecen al mismo patrón de spam SEO o inyección y no a hallazgos sueltos.")
+    return ""
+
+
+def _ext_parts(ext: dict) -> list:
+    """Enlaces externos (punto 2): cuantos no son alerta, y con que respaldo."""
+    if not ext.get("total"):
+        return []
+    out = [f"Se analizaron {_plural(ext['total'], 'dominio externo', 'dominios externos')}: "
+           f"{_plural(ext['legit'], 'no representa', 'no representan')} riesgo"
+           + (f" y {_plural(ext['review'], 'requiere revisión', 'requieren revisión')} "
+              f"({_join(ext['review_hosts'], 3)})." if ext.get("review") else ".")]
+    conf, unv = ext.get("confirmed", 0), ext.get("unverified", 0)
+    conf_ex, unv_ex = _join(ext.get("confirmed_hosts", []), 3), _join(ext.get("unverified_hosts", []), 3)
+    if conf and unv:
+        out.append(f"De los que no representan riesgo, {_plural(conf, 'es una fuente institucional', 'son fuentes institucionales')}, "
+                   f"plataforma{'' if conf == 1 else 's'} conocida{'' if conf == 1 else 's'} o servicio{'' if conf == 1 else 's'} "
+                   f"declarado{'' if conf == 1 else 's'} por la campaña{f' (p. ej. {conf_ex})' if conf_ex else ''}, "
+                   f"y {_plural(unv, 'no muestra indicios', 'no muestran indicios')} de riesgo, aunque su coherencia con el "
+                   f"negocio no se ha verificado{f' ({unv_ex})' if unv_ex else ''}.")
+    elif conf:
+        out.append(f"{_plural(conf, 'Es una fuente institucional', 'Son fuentes institucionales')}, plataformas conocidas "
+                   f"o servicios declarados por la campaña{f' (p. ej. {conf_ex})' if conf_ex else ''}.")
+    elif unv:
+        out.append(f"{_plural(unv, 'No muestra indicios', 'No muestran indicios')} de riesgo, pero su coherencia con la "
+                   f"actividad del sitio no se ha verificado{f' ({unv_ex})' if unv_ex else ''}: conviene revisarlos a mano "
+                   f"o declarar los que sean servicios de la campaña.")
+    return out
 
 
 def fallback_analysis(facts: dict) -> dict:
@@ -402,38 +479,63 @@ def fallback_analysis(facts: dict) -> dict:
                 f"También hay «{g['label']}»: {_plural(g['items'], 'elemento', 'elementos')}"
                 + (f" (p. ej. {ex_pages})" if ex_pages else "") + "."
             )
+        # Que se encontro, que comportamiento tiene y si todo apunta al mismo patron
+        for sentence in (_findings_sentence(top) if top else "", _code_sentence(groups), _pattern_sentence(groups)):
+            if sentence:
+                parts.append(sentence)
         for g in groups:
             hosts = Counter(e["resource"] for e in g["examples"] if e.get("resource"))
             if g["items"] >= 2 and hosts and hosts.most_common(1)[0][1] >= 2:
                 h = hosts.most_common(1)[0][0]
                 rel.append(f"Varias alertas de «{g['label']}» comparten el mismo origen ({h}): probablemente la misma inyección.")
                 break
-    if ext.get("total"):
-        legit_txt = (f"Se analizaron {_plural(ext['total'], 'dominio externo', 'dominios externos')}: "
-                     f"{_plural(ext['legit'], 'es coherente', 'son coherentes')} con la actividad del sitio y no {'representa' if ext['legit'] == 1 else 'representan'} riesgo")
-        if ext.get("review"):
-            legit_txt += f"; {_plural(ext['review'], 'requiere revisión', 'requieren revisión')} ({_join(ext['review_hosts'], 3)})."
-        else:
-            legit_txt += "."
-        parts.append(legit_txt)
+    parts.extend(_ext_parts(ext))
 
     h = facts.get("history", {})
-    if h.get("persistent"):
+    if s.get("persistent"):
         ex = _join(h.get("persistent_examples", []), 2)
-        parts.append(f"{_plural(s['persistent'], 'elemento continúa', 'elementos continúan')} presente(s) desde auditorías anteriores"
+        parts.append(f"{_plural(s['persistent'], 'elemento continúa presente', 'elementos continúan presentes')} desde auditorías anteriores"
                      + (f" (p. ej. {ex})" if ex else "") + ", por lo que no son hallazgos nuevos.")
     if s["new"]:
         parts.append(f"{_plural(s['new'], 'elemento es nuevo', 'elementos son nuevos')} respecto a la auditoría anterior.")
     if s["reopened"]:
         parts.append(f"{_plural(s['reopened'], 'elemento reapareció', 'elementos reaparecieron')} tras haber desaparecido.")
     if s["resolved"]:
-        parts.append(f"{_plural(s['resolved'], 'elemento ya no aparece', 'elementos ya no aparecen')} desde la última auditoría.")
+        rex = _join(h.get("resolved_examples", []), 2)
+        parts.append(f"{_plural(s['resolved'], 'elemento ya no aparece', 'elementos ya no aparecen')} desde la última auditoría"
+                     + (f" (p. ej. {rex})" if rex else "") + ".")
+    prev = h.get("previous_alerts")
+    if prev is not None and groups:
+        now = s["alerts"]
+        trend = ("disminuyó" if now < prev else "aumentó" if now > prev else "se mantuvo igual")
+        parts.append(f"En comparación con la auditoría anterior ({_plural(prev, 'alerta', 'alertas')}), la cantidad {trend}"
+                     + (f" ({now} ahora)." if now != prev else "."))
+    spam_keys = [k for k in ("casino", "pharmacy", "adult", "loans_crypto", "replicas", "services") if k not in {g["key"] for g in groups}]
+    if groups and spam_keys and any(g["key"] in ("casino", "pharmacy", "adult", "loans_crypto", "replicas", "services") for g in groups):
+        names = [tx.label(k).lower() for k in spam_keys[:3]]
+        parts.append("No se detectaron casos relacionados con " + (", ".join(names[:-1]) + " ni " + names[-1] if len(names) > 1 else names[0]) + ".")
     if s["auto_fixed"]:
-        parts.append(f"{_plural(s['auto_fixed'], 'elemento fue corregido', 'elementos fueron corregidos')} automáticamente al superar la confianza configurada.")
+        fx = _join([p for g in groups for p in (g.get("fixed_pages") or [])], 3)
+        parts.append(f"{_plural(s['auto_fixed'], 'elemento fue corregido', 'elementos fueron corregidos')} automáticamente "
+                     f"al superar la confianza configurada{f' ({fx})' if fx else ''}.")
     if s["dry_run"]:
         parts.append(f"{_plural(s['dry_run'], 'corrección se simuló', 'correcciones se simularon')} sin modificar el sitio (modo simulación).")
     if s["pending"]:
-        parts.append(f"{_plural(s['pending'], 'elemento queda pendiente', 'elementos quedan pendientes')} de autorización.")
+        pend = facts.get("pending") or []
+        pg = _join([p.get("page") or p.get("resource") for p in pend], 3)
+        blob = " ".join(p.get("reason") or "" for p in pend).lower()
+        why = []
+        if "umbral" in blob:
+            why.append("la confianza no alcanzó el umbral configurado")
+        if "sensible" in blob:
+            why.append("son acciones sensibles que siempre requieren autorización")
+        if "desactivada" in blob:
+            why.append("la corrección automática está desactivada en la campaña")
+        if "no está permitida" in blob:
+            why.append("la acción no está permitida en la campaña")
+        parts.append(f"{_plural(s['pending'], 'elemento queda pendiente', 'elementos quedan pendientes')} de autorización"
+                     f"{f' ({pg})' if pg else ''}"
+                     f"{' porque ' + _join_and(why, 2) if why else ''}.")
     if s["failed"]:
         parts.append(f"{_plural(s['failed'], 'corrección falló', 'correcciones fallaron')} y requieren intervención manual.")
 

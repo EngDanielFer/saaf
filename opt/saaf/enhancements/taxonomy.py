@@ -43,6 +43,8 @@ _T = {
         ("casino", "S", True), ("kazino", "S", True), ("gacor", "S", True), ("togel", "S", True),
         ("mostbet", "S", True), ("1win", "S", True), ("sbobet", "S", True), ("1xbet", "S", True),
         ("melbet", "S", True), ("parimatch", "S", True), ("sportsbook", "S", True),
+        ("betsson", "S", True), ("bet365", "S", True), ("bwin", "S", True), ("unibet", "S", True),
+        ("pokerstars", "S", True), ("draftkings", "S", True), ("fanduel", "S", True), ("betway", "S", True),
         ("baccarat", "S", True), ("roulette", "S", True), ("blackjack", "S", True),
         ("nongamstop", "S", True), ("non gamstop", "S", False), ("slot gacor", "S", False),
         ("slot online", "S", False), ("situs slot", "S", False), ("judi online", "S", False),
