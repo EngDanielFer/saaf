@@ -1,220 +1,431 @@
 # =============================================================
-# SAAF Pro — enhancements/links.py
-# Inventario de ENLACES EXTERNOS del sitio y veredicto de coherencia.
+# SAAF Pro — enhancements/reporting.py
+# Construye el reporte final (punto 8): resumen cuantitativo + grupos +
+# enlaces externos + historial + pendientes + analisis global de IA, y lo
+# renderiza como texto, HTML (correo) y tarjeta adaptable (Teams).
 #
-# Un enlace externo NO es una alerta por si mismo (ej.: una empresa de
-# cercas cita municipios, permisos, asociaciones, fabricantes). Aqui se
-# agrupan los enlaces por dominio y se decide cuales son coherentes (quedan
-# registrados como "recurso analizado y valido") y cuales requieren revision.
-#
-# Este modulo da el veredicto HEURISTICO. La IA (ai_context.py) puede
-# confirmarlo o escalarlo a "revisar", pero NUNCA puede marcar como legitimo
-# un dominio que la heuristica considera de riesgo (hard_bad): un texto
-# inyectado en la pagina no debe poder convencer a la IA de que un enlace
-# spam es bueno.
+# Las URLs de RECURSOS externos se muestran "desarmadas" (hxxps://dominio[.]com)
+# en correo y Teams para que nadie haga clic por accidente en spam/malware.
+# Todo texto que viene del sitio auditado se escapa antes de ir a HTML.
 # =============================================================
 
+import html as _html
+import os
 import re
+from collections import Counter, defaultdict
 
-from bs4 import BeautifulSoup
+from database import to_local_str
 
-from url_utils import split_url, registrable_domain, get_host
-
+from . import history as hist
+from . import links as lk
 from . import taxonomy as tx
-from .items import res_key
+from .items import page_path, res_key
 
-MAX_DOMAINS = 150
-
-# Dominios registrables generalmente legitimos para citar desde un sitio de empresa.
-TRUSTED_DOMAINS = {
-    "facebook.com", "instagram.com", "youtube.com", "youtu.be", "linkedin.com", "twitter.com",
-    "x.com", "tiktok.com", "pinterest.com", "wa.me", "whatsapp.com", "t.me", "telegram.org",
-    "google.com", "goo.gl", "g.page", "maps.app.goo.gl", "apple.com", "microsoft.com",
-    "wikipedia.org", "github.com", "wordpress.org", "wordpress.com", "gravatar.com",
-    "yelp.com", "bbb.org", "trustpilot.com", "angi.com", "houzz.com", "nextdoor.com",
-    "schema.org", "w3.org", "mozilla.org", "creativecommons.org",
-}
-_GOV_EDU_RE = re.compile(r"(^|\.)(gov|edu|mil|gob|gouv|int)(\.[a-z]{2})?$")
+STATE_LABEL = {"limpio": "Sin hallazgos relevantes", "atencion": "Requiere atención",
+               "comprometido": "Posible compromiso"}
+STATE_ICON = {"limpio": "🟢", "atencion": "🟠", "comprometido": "🔴"}
+SEV_ORDER = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
+MAX_EXAMPLES = 5
 
 
-def _is_trusted(reg: str) -> bool:
-    return reg in TRUSTED_DOMAINS or bool(_GOV_EDU_RE.search(reg))
+def defang(url) -> str:
+    """https://evil.com/x -> hxxps://evil[.]com/x  (texto, no enlace)."""
+    if not url:
+        return ""
+    u = str(url).strip()
+    m = re.match(r"^(https?)://([^/\s]+)(.*)$", u, re.I)
+    if m:
+        scheme = m.group(1).lower().replace("http", "hxxp")
+        return f"{scheme}://{m.group(2).replace('.', '[.]')}{m.group(3)}"
+    if re.match(r"^[\w\-]+(\.[\w\-]+)+(/.*)?$", u):
+        host, _, rest = u.partition("/")
+        return host.replace(".", "[.]") + (("/" + rest) if rest else "")
+    return u
 
 
-def extract_external_links(html_results: list, site_url: str, old_domains=None) -> dict:
-    """
-    {dominio_registrable: info} con los enlaces <a href> a dominios ajenos al sitio.
-    No toma en cuenta los dominios antiguos del sitio (los cubre otro detector).
-    """
-    from analyzer import _is_hidden_or_ancestor_hidden  # import perezoso
+def _sev_max(items):
+    return max((i.get("severity") or "LOW" for i in items), key=lambda s: SEV_ORDER.index(s) if s in SEV_ORDER else 0)
 
-    site_reg = registrable_domain(get_host(site_url))
-    old = {registrable_domain(d.strip().lower()) for d in (old_domains or []) if d and d.strip()}
-    out = {}
-    for res in html_results or []:
-        html, page = res.get("html"), res.get("url") or site_url
-        if res.get("error") or not html:
+
+# ------------------------------------------------------------------
+# Hechos del reporte
+# ------------------------------------------------------------------
+def build_facts(site: dict, audit: dict, items: list, link_rows: list, link_summary: dict,
+                hist_result: dict, rem_counters: dict, expected_langs: list, ai_info: dict,
+                legit_items: list = None, important_threshold: str = "HIGH") -> dict:
+    legit_items = legit_items or []
+    by_cat = defaultdict(list)
+    for it in items:
+        by_cat[it["category"]].append(it)
+
+    groups = []
+    for cat in tx.CATEGORY_ORDER:
+        members = by_cat.get(cat)
+        if not members:
             continue
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-        except Exception:
-            continue
-        for a in soup.find_all("a", href=True):
-            href = (a.get("href") or "").strip()
-            if not href.startswith(("http://", "https://", "//")):
-                continue
-            if href.startswith("//"):
-                href = "https:" + href
-            host = get_host(href)
-            if not host:
-                continue
-            reg = registrable_domain(host)
-            if not reg or reg == site_reg or reg in old:
-                continue
-            info = out.setdefault(
-                reg,
-                {"host": reg, "sample_url": href, "sample_urls": [], "links_count": 0, "pages": [],
-                 "anchors": [], "hidden_count": 0},
-            )
-            info["links_count"] += 1
-            if page not in info["pages"]:
-                info["pages"].append(page)
-            if href not in info["sample_urls"] and len(info["sample_urls"]) < 5:
-                info["sample_urls"].append(href)
-            text = a.get_text(" ", strip=True)[:80]
-            if text and text not in info["anchors"] and len(info["anchors"]) < 8:
-                info["anchors"].append(text)
-            try:
-                if _is_hidden_or_ancestor_hidden(a):
-                    info["hidden_count"] += 1
-            except Exception:
-                pass
-    return out
+        members = sorted(members, key=lambda i: -int(i.get("confidence") or 0))
+        pages = {page_path(m.get("page_url")) for m in members if m.get("page_url")}
+        statuses = Counter(m.get("lifecycle") or m.get("status") for m in members)
+        # Que se encontro realmente (para que el analisis no sea generico):
+        # terminos citables, dominios de los recursos y huellas de codigo.
+        term_count = Counter(t for m in members for t in (m.get("terms") or []))
+        # "casino" y "casino online" dicen lo mismo: se conserva el mas corto
+        for t in sorted(term_count, key=len):
+            for other in [x for x in term_count if x != t and len(x) > len(t)]:
+                if t in other:
+                    term_count.pop(other, None)
+        host_count = Counter(res_key(m["resource_url"]).split("/")[0]
+                             for m in members if m.get("resource_url"))
+        code_notes = list(dict.fromkeys(d for m in members for d in (m.get("code_notes") or [])))
+        fixed_pages = [page_path(m.get("page_url")) for m in members if m.get("rem_status") == "APPLIED"]
+        pending_pages = [page_path(m.get("page_url")) for m in members
+                         if m.get("rem_status") == "PENDING_AUTHORIZATION"]
+        # "Mismo patron": varios elementos repartidos en varias paginas que comparten
+        # un termino o un mismo recurso de origen -> probablemente una sola inyeccion.
+        shared_term = [t for t, c in term_count.items() if c >= 2]
+        shared_host = [h for h, c in host_count.items() if c >= 2]
+        same_pattern = bool(len(members) >= 3 and len(pages) >= 2 and (shared_term or shared_host))
+        groups.append({
+            "key": cat,
+            "label": tx.label(cat),
+            "items": len(members),
+            "pages": len(pages),
+            "confidence": round(sum(int(m.get("confidence") or 0) for m in members) / len(members)),
+            "severity": _sev_max(members),
+            "statuses": dict(statuses),
+            "auto_fixed": sum(1 for m in members if m.get("rem_status") == "APPLIED"),
+            "pending": sum(1 for m in members if m.get("rem_status") == "PENDING_AUTHORIZATION"),
+            "dry_run": sum(1 for m in members if m.get("rem_status") == "DRY_RUN"),
+            "failed": sum(1 for m in members if m.get("rem_status") == "FAILED"),
+            "terms": [t for t, _ in term_count.most_common(6)],
+            "hosts": [h for h, _ in host_count.most_common(4)],
+            "code_notes": code_notes[:3],
+            "fixed_pages": fixed_pages[:5],
+            "pending_pages": pending_pages[:5],
+            "same_pattern": same_pattern,
+            "examples": [
+                {
+                    "page": page_path(m.get("page_url")),
+                    "resource": res_key(m.get("resource_url")) if m.get("resource_url") else "",
+                    "type": m.get("threat_type"),
+                    "status": m.get("status"),
+                    "lifecycle": m.get("lifecycle"),
+                    "confidence": int(m.get("confidence") or 0),
+                    "action": m.get("rem_status"),
+                }
+                for m in members[:MAX_EXAMPLES]
+            ],
+        })
+    groups.sort(key=lambda g: (-SEV_ORDER.index(g["severity"]) if g["severity"] in SEV_ORDER else 0, -g["items"]))
 
-
-def heuristic_verdicts(domains: dict, niche: str = "", spam_domains=None, site_url: str = "") -> list:
-    """Lista de dicts (uno por dominio) con verdict/confidence/reason, ordenada por n.o de enlaces."""
-    from risk_signals import evaluate_resource, LINK
-
-    spam_domains = set(spam_domains or [])
-    spam_regex = re.compile(
-        r"\b(" + "|".join(sorted({t for cat in tx.TOPIC_CATEGORIES for t, s, _ in tx._T[cat] if s == "S"},
-                                  key=len, reverse=True)).replace(" ", r"\s") + r")\b", re.I
-    )
-    base = get_host(site_url)
-    rows = []
-    for reg, info in sorted(domains.items(), key=lambda kv: -kv[1]["links_count"])[:MAX_DOMAINS]:
-        found = tx.find_terms(
-            {"url": res_key(info["sample_url"]), "text": " ".join(info["anchors"])}, niche
-        )
-        topic_cat, topic_p, terms = tx.best_topic(found)
-        is_spam_dom = any(reg == d or reg.endswith("." + d) or d.endswith("." + reg) for d in spam_domains)
-        try:
-            signals = evaluate_resource(
-                info["sample_url"], LINK, base_domain=base, is_spam_domain=is_spam_dom,
-                spam_pattern=spam_regex,
-            )
-        except Exception:
-            signals = []
-        strong = [s for s in signals if s.strong]
-        trusted = _is_trusted(reg)
-        hard_bad = bool(is_spam_dom or strong or (topic_p >= 0.6 and not trusted))
-
-        verdict, reason = "legit", ""
-        p = 0.0
-        if hard_bad:
-            verdict = "review"
-            p = tx.combine_prob(topic_p, *([0.5] * len(strong)), 0.9 if is_spam_dom else 0.0)
-            bits = []
-            if is_spam_dom:
-                bits.append("dominio en la lista de spam")
-            if terms:
-                bits.append("indicadores: " + ", ".join(sorted(terms)[:4]))
-            bits += [s.label for s in strong[:2]]
-            reason = "; ".join(bits) or "señales de riesgo"
-        elif info["hidden_count"] and not trusted:
-            verdict, p = "review", 0.6
-            reason = f"{info['hidden_count']} enlace(s) oculto(s) con CSS hacia un dominio no reconocido"
-        elif trusted:
-            p = 0.9
-            reason = "dominio institucional o plataforma conocida"
-        else:
-            p = 0.6
-            reason = "sin indicios de riesgo, pero su coherencia con el negocio no se ha verificado"
-        rows.append(
-            {
-                "host": reg,
-                "sample_url": info["sample_url"],
-                "sample_urls": info["sample_urls"],
-                "links_count": info["links_count"],
-                "pages_count": len(info["pages"]),
-                "sample_pages": info["pages"][:5],
-                "all_pages": info["pages"],
-                "anchors": info["anchors"],
-                "hidden_count": info["hidden_count"],
-                "verdict": verdict,
-                "confidence": tx.pct(p),
-                "reason": reason,
-                "source": "heuristic",
-                "hard_bad": hard_bad,
-                "trusted": trusted,
-                "category": topic_cat,
-            }
-        )
-    return rows
-
-
-def apply_ai_verdicts(rows: list, ai_links: list) -> int:
-    """Aplica los veredictos de la IA sobre las filas heuristicas. Devuelve cuantas cambiaron."""
-    by_host = {r["host"]: r for r in rows}
-    changed = 0
-    for v in ai_links or []:
-        host = str(v.get("domain") or v.get("host") or "").strip().lower()
-        row = by_host.get(host)
-        if not row:
-            continue
-        verdict = str(v.get("verdict") or "").lower()
-        if verdict not in ("legit", "review"):
-            continue
-        conf = max(0, min(100, int(v.get("confidence") or 0)))
-        reason = str(v.get("reason") or "")[:240]
-        if verdict == "legit" and row["hard_bad"]:
-            continue  # la IA no puede absolver lo que la heuristica considera de riesgo
-        if verdict != row["verdict"]:
-            changed += 1
-        row["verdict"] = verdict
-        row["confidence"] = conf if conf else row["confidence"]
-        if reason:
-            row["reason"] = reason
-        row["source"] = "ia"
-    return changed
-
-
-def is_confirmed(row: dict) -> bool:
-    """
-    Un dominio "legit" puede serlo por dos motivos muy distintos:
-      * CONFIRMADO: es institucional (.gov/.edu) o una plataforma conocida, lo
-        declaro la campania como servicio de terceros, o la IA lo juzgo coherente.
-      * NO VERIFICADO: simplemente no muestra indicios de riesgo. No es alerta,
-        pero decir que "es coherente con la actividad del sitio" seria inexacto.
-    """
-    return row["verdict"] == "legit" and (bool(row.get("trusted")) or row.get("source") in ("ia", "campaña"))
-
-
-def summarize(rows: list) -> dict:
-    legit = [r for r in rows if r["verdict"] == "legit"]
-    review = [r for r in rows if r["verdict"] == "review"]
-    confirmed = [r for r in legit if is_confirmed(r)]
-    unverified = [r for r in legit if not is_confirmed(r)]
-    return {
-        "domains": len(rows),
-        "links": sum(r["links_count"] for r in rows),
-        "legit": len(legit),          # total que NO es alerta (confirmados + no verificados)
-        "review": len(review),
-        "confirmed": len(confirmed),  # coherencia respaldada (institucional, declarado o IA)
-        "unverified": len(unverified),
-        "legit_hosts": [r["host"] for r in legit],
-        "review_hosts": [r["host"] for r in review],
-        "confirmed_hosts": [r["host"] for r in confirmed],
-        "unverified_hosts": [r["host"] for r in unverified],
+    n = lambda pred: sum(1 for i in items if pred(i))
+    summary = {
+        "alerts": len(items),
+        "groups": len(groups),
+        "auto_fixed": n(lambda i: i.get("rem_status") == "APPLIED"),
+        "pending": n(lambda i: i.get("rem_status") == "PENDING_AUTHORIZATION"),
+        "persistent": n(lambda i: i.get("lifecycle") == hist.PERSISTENT),
+        "resolved": len(hist_result.get("resolved", [])),
+        "new": n(lambda i: i.get("lifecycle") == hist.NEW),
+        "reopened": n(lambda i: i.get("lifecycle") == hist.REOPENED),
+        "dry_run": n(lambda i: i.get("rem_status") == "DRY_RUN"),
+        "failed": n(lambda i: i.get("rem_status") == "FAILED"),
+        "legit_resources": link_summary.get("legit", 0) + len(legit_items),
+        "unverified": hist_result.get("unverified", 0),
     }
+
+    unresolved = [i for i in items if i.get("rem_status") != "APPLIED"]
+    if not unresolved:
+        state = "limpio"
+    elif any(i.get("severity") == "CRITICAL" for i in unresolved) or \
+            sum(1 for i in unresolved if i["category"] in tx.SPAM_CATEGORIES and int(i.get("confidence") or 0) >= 70) >= 5 or \
+            any(i.get("severity") in ("CRITICAL", "HIGH") and i.get("corroborated") and int(i.get("confidence") or 0) >= 80
+                for i in unresolved):
+        # Un hallazgo grave, respaldado por indicadores deterministas y con alta confianza (p. ej. un cargador
+        # de malware o una página de spam inyectada) ya es un posible compromiso.
+        state = "comprometido"
+    else:
+        state = "atencion"
+
+    review_rows = [r for r in link_rows if r["verdict"] == "review"]
+    unverified_rows = [r for r in link_rows if r["verdict"] == "legit" and not lk.is_confirmed(r)]
+    facts = {
+        "site": {"id": site["id"], "name": site["name"], "url": site["url"], "niche": site.get("niche"),
+                 "host": res_key(site["url"]).split("/")[0]},
+        "audit": audit,
+        "summary": summary,
+        "site_state": state,
+        "groups": groups,
+        "external_links": {
+            "total": link_summary.get("domains", 0),
+            "links": link_summary.get("links", 0),
+            "legit": link_summary.get("legit", 0),
+            "review": link_summary.get("review", 0),
+            "confirmed": link_summary.get("confirmed", 0),
+            "unverified": link_summary.get("unverified", 0),
+            "review_hosts": link_summary.get("review_hosts", []),
+            "review_list": [
+                {"host": r["host"], "reason": r["reason"], "confidence": r["confidence"],
+                 "pages": [page_path(p) for p in r["sample_pages"][:3]]}
+                for r in review_rows[:10]
+            ],
+            "legit_hosts": link_summary.get("legit_hosts", [])[:30],
+            "confirmed_hosts": link_summary.get("confirmed_hosts", [])[:30],
+            "unverified_hosts": link_summary.get("unverified_hosts", [])[:30],
+            "unverified_list": [
+                {"host": r["host"], "reason": r["reason"], "links": r["links_count"],
+                 "pages": [page_path(p) for p in r["sample_pages"][:3]]}
+                for r in unverified_rows[:10]
+            ],
+        },
+        "history": {
+            "previous_audit_id": hist_result.get("previous_audit_id"),
+            "persistent_examples": [
+                f"{page_path(i.get('page_url'))}" + (f" ({res_key(i['resource_url'])})" if i.get("resource_url") else "")
+                for i in items if i.get("lifecycle") == hist.PERSISTENT
+            ][:5],
+            "new_examples": [page_path(i.get("page_url")) for i in items if i.get("lifecycle") == hist.NEW][:5],
+            "resolved_examples": [
+                page_path(r.get("page_url")) or r.get("fingerprint") for r in hist_result.get("resolved", [])
+            ][:5],
+            "reopened_examples": [page_path(i.get("page_url")) for i in items if i.get("lifecycle") == hist.REOPENED][:5],
+        },
+        "pending": [
+            {"page": page_path(i.get("page_url")), "resource": res_key(i.get("resource_url")) if i.get("resource_url") else "",
+             "category": tx.label(i["category"]), "confidence": int(i.get("confidence") or 0),
+             "action": i.get("rem_action"), "reason": i.get("rem_message", "")}
+            for i in items if i.get("rem_status") == "PENDING_AUTHORIZATION"
+        ][:15],
+        "remediation": {k: rem_counters.get(k, 0) for k in ("auto_applied", "dry_run", "failed", "pending")},
+        "expected_languages": expected_langs,
+        "ai": ai_info,
+    }
+    facts["important"] = is_important(facts)
+    return facts
+
+
+def is_important(facts: dict) -> bool:
+    """Importante = algo que pide atencion: pendiente de autorizacion, reabierto, correccion fallida,
+    o un hallazgo CRITICAL/HIGH que sigue sin corregir."""
+    s = facts["summary"]
+    if s["pending"] or s["reopened"] or s["failed"]:
+        return True
+    return any(g["severity"] in ("CRITICAL", "HIGH") and (g["items"] - g["auto_fixed"]) > 0 for g in facts["groups"])
+
+
+# ------------------------------------------------------------------
+# Texto plano
+# ------------------------------------------------------------------
+SUMMARY_LINES = (
+    ("alerts", "Alertas detectadas"),
+    ("groups", "Problemas agrupados"),
+    ("auto_fixed", "Corregidos automáticamente"),
+    ("pending", "Pendientes de autorización"),
+    ("persistent", "Persistentes desde auditorías anteriores"),
+    ("resolved", "Resueltos desde la última auditoría"),
+)
+EXTRA_LINES = (
+    ("new", "Nuevos"), ("reopened", "Reabiertos"), ("dry_run", "Correcciones simuladas (sin cambios)"),
+    ("failed", "Correcciones fallidas"), ("legit_resources", "Recursos analizados y válidos"),
+    ("muted_alerts", "Alertas originales omitidas (reversible)"),
+)
+
+
+def _when(facts):
+    a = facts["audit"]
+    return to_local_str(a.get("finished_at") or a.get("started_at")) if a else ""
+
+
+def _ext_sentence(facts):
+    e = facts["external_links"]
+    if not e["total"]:
+        return ""
+    n = e["total"]
+    s = (f"Se analizaron {n} {'enlace externo (dominio)' if n == 1 else 'enlaces externos (dominios)'}. "
+         f"{e['legit']} no {'representa' if e['legit'] == 1 else 'representan'} riesgo")
+    # Punto 2: no es lo mismo "coherente con el negocio" (institucional, declarado
+    # por la campania o juzgado por la IA) que "sin indicios, pero sin verificar".
+    conf, unv = e.get("confirmed", 0), e.get("unverified", 0)
+    if conf and unv:
+        s += (f" ({conf} {'es fuente institucional, plataforma conocida o servicio declarado' if conf == 1 else 'son fuentes institucionales, plataformas conocidas o servicios declarados'}; "
+              f"{unv} sin indicios de riesgo pero sin verificar su coherencia)")
+    elif unv and not conf:
+        s += f" ({'ninguno está verificado' if unv > 1 else 'sin verificar su coherencia'})"
+    s += "."
+    if e["review"]:
+        s += f" Se {'identificó' if e['review'] == 1 else 'identificaron'} {e['review']} que {'requiere' if e['review'] == 1 else 'requieren'} revisión."
+    return s
+
+
+def render_text(report: dict) -> str:
+    f, an = report["facts"], report["analysis"]
+    s = f["summary"]
+    L = [
+        f"SAAF Pro — Reporte de auditoría",
+        f"Campaña: {f['site']['name']} ({f['site']['url']})",
+        f"Auditoría #{f['audit']['id']} — {_when(f)}   Estado: {STATE_ICON[f['site_state']]} {STATE_LABEL[f['site_state']]}",
+        "", "RESUMEN", "-" * 40,
+    ]
+    for k, lab in SUMMARY_LINES:
+        L.append(f"  {lab}: {s[k]}")
+    for k, lab in EXTRA_LINES:
+        if s.get(k):
+            L.append(f"  {lab}: {s[k]}")
+    L += ["", "ANÁLISIS GENERAL" + (" (IA)" if an.get("ai_used") else " (automático)"), "-" * 40, an["text"]]
+    if an.get("relationships"):
+        L.append("")
+        L += [f"  • {r}" for r in an["relationships"]]
+    if f["groups"]:
+        L += ["", "PROBLEMAS AGRUPADOS", "-" * 40]
+        for i, g in enumerate(f["groups"], 1):
+            st = ", ".join(f"{hist.STATE_LABEL.get(k, k)} {v}" for k, v in g["statuses"].items() if k)
+            L.append(f"{i}. {g['label']} — {g['items']} elemento(s) · {g['pages']} página(s) · confianza {g['confidence']}% · {g['severity']}")
+            if st:
+                L.append(f"   Estado: {st}")
+            for e in g["examples"]:
+                res = f" → {defang(e['resource'])}" if e["resource"] else ""
+                act = {"APPLIED": " [corregido]", "PENDING_AUTHORIZATION": " [pendiente de autorización]",
+                       "DRY_RUN": " [simulado]", "FAILED": " [corrección fallida]"}.get(e["action"], "")
+                L.append(f"   • {e['page']}{res} ({e['confidence']}%){act}")
+    if _ext_sentence(f):
+        L += ["", "ENLACES EXTERNOS", "-" * 40, _ext_sentence(f)]
+        for r in f["external_links"]["review_list"]:
+            L.append(f"   • {defang(r['host'])} — {r['reason']}")
+        unv = f["external_links"].get("unverified_list") or []
+        if unv:
+            L.append("   Sin indicios de riesgo, pero sin verificar (declara los que use la campaña):")
+            for r in unv[:5]:
+                L.append(f"   • {defang(r['host'])} — {r['links']} enlace(s)")
+            if f["external_links"].get("unverified", 0) > 5:
+                L.append(f"   • … y {f['external_links']['unverified'] - 5} más (ver el dashboard)")
+    if f["pending"]:
+        L += ["", "PENDIENTES DE AUTORIZACIÓN", "-" * 40]
+        for p in f["pending"]:
+            L.append(f"   • {p['page']} — {p['category']} ({p['confidence']}%) — {p['reason']}")
+        dash = os.environ.get("SAAF_DASHBOARD_URL", "")
+        L.append("   Autoriza o rechaza desde el dashboard (🧠 Auditoría IA)" + (f": {dash}" if dash else "."))
+    if an.get("error_human"):
+        L += ["", f"Nota: {an['error_human']}"]
+    return "\n".join(L)
+
+
+# ------------------------------------------------------------------
+# HTML (correo)
+# ------------------------------------------------------------------
+def _e(x):
+    return _html.escape(str(x if x is not None else ""), quote=True)
+
+
+def render_html(report: dict) -> str:
+    f, an = report["facts"], report["analysis"]
+    s = f["summary"]
+    color = {"limpio": "#16A34A", "atencion": "#EA580C", "comprometido": "#DC2626"}[f["site_state"]]
+    tiles = "".join(
+        f'<td style="padding:10px 14px;border:1px solid #E2E8F0;text-align:center;border-radius:6px">'
+        f'<div style="font-size:22px;font-weight:700;color:#0F172A">{_e(s[k])}</div>'
+        f'<div style="font-size:11px;color:#64748B">{_e(lab)}</div></td>'
+        for k, lab in SUMMARY_LINES
+    )
+    rows = ""
+    for g in f["groups"]:
+        ex = "".join(
+            f'<li style="margin:2px 0"><code>{_e(e["page"])}</code>'
+            + (f' → <code>{_e(defang(e["resource"]))}</code>' if e["resource"] else "")
+            + f' <span style="color:#64748B">({_e(e["confidence"])}%)</span></li>'
+            for e in g["examples"]
+        )
+        st = ", ".join(f"{_e(hist.STATE_LABEL.get(k, k))} {_e(v)}" for k, v in g["statuses"].items() if k)
+        rows += (
+            f'<tr><td style="padding:8px;border-bottom:1px solid #E2E8F0;vertical-align:top">'
+            f'<b>{_e(g["label"])}</b><br><span style="color:#64748B;font-size:12px">{st}</span></td>'
+            f'<td style="padding:8px;border-bottom:1px solid #E2E8F0;text-align:center">{_e(g["items"])}<br>'
+            f'<span style="font-size:11px;color:#64748B">{_e(g["pages"])} pág.</span></td>'
+            f'<td style="padding:8px;border-bottom:1px solid #E2E8F0;text-align:center">{_e(g["confidence"])}%</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #E2E8F0;font-size:12px"><ul style="margin:0;padding-left:16px">{ex}</ul></td></tr>'
+        )
+    groups_html = (
+        '<h3 style="margin:22px 0 6px">Problemas agrupados</h3>'
+        '<table style="border-collapse:collapse;width:100%;font-size:13px"><tr style="background:#F1F5F9;text-align:left">'
+        '<th style="padding:8px">Problema</th><th style="padding:8px">Elementos</th><th style="padding:8px">Confianza</th>'
+        f'<th style="padding:8px">Ejemplos</th></tr>{rows}</table>'
+    ) if rows else ""
+    ext = _ext_sentence(f)
+    ext_html = ""
+    if ext:
+        li = "".join(f"<li><code>{_e(defang(r['host']))}</code> — {_e(r['reason'])}</li>" for r in f["external_links"]["review_list"])
+        unv = f["external_links"].get("unverified_list") or []
+        unv_html = ""
+        if unv:
+            ul = "".join(f"<li><code>{_e(defang(r['host']))}</code> — {_e(r['links'])} enlace(s)</li>" for r in unv[:5])
+            if f["external_links"].get("unverified", 0) > 5:
+                ul += f"<li>… y {_e(f['external_links']['unverified'] - 5)} más</li>"
+            unv_html = ('<p style="color:#64748B;font-size:13px;margin:8px 0 2px">Sin indicios de riesgo, pero sin '
+                        f'verificar su coherencia con el negocio:</p><ul>{ul}</ul>')
+        ext_html = (f'<h3 style="margin:22px 0 6px">Enlaces externos</h3><p>{_e(ext)}</p>'
+                    + (f"<ul>{li}</ul>" if li else "") + unv_html)
+    pend_html = ""
+    if f["pending"]:
+        li = "".join(f"<li><code>{_e(p['page'])}</code> — {_e(p['category'])} ({_e(p['confidence'])}%)<br>"
+                     f"<span style='color:#64748B;font-size:12px'>{_e(p['reason'])}</span></li>" for p in f["pending"])
+        dash = os.environ.get("SAAF_DASHBOARD_URL", "")
+        pend_html = (f'<h3 style="margin:22px 0 6px">⏳ Pendientes de autorización</h3><ul>{li}</ul>'
+                     f'<p style="font-size:12px;color:#64748B">Autoriza o rechaza desde el dashboard (🧠 Auditoría IA)'
+                     + (f': {_e(dash)}' if dash else '.') + '</p>')
+    rel = "".join(f"<li>{_e(r)}</li>" for r in an.get("relationships", []))
+    note = f'<p style="font-size:12px;color:#94A3B8">Nota: {_e(an["error_human"])}</p>' if an.get("error_human") else ""
+    return f"""<!doctype html><html><body style="font-family:Segoe UI,Arial,sans-serif;color:#0F172A;max-width:760px;margin:auto">
+<div style="border-left:6px solid {color};padding:6px 14px;margin-bottom:14px">
+<div style="font-size:12px;color:#64748B">SAAF Pro — Reporte de auditoría</div>
+<div style="font-size:20px;font-weight:700">{_e(f['site']['name'])}</div>
+<div style="font-size:13px;color:#475569">{_e(f['site']['url'])} · Auditoría #{_e(f['audit']['id'])} · {_e(_when(f))}</div>
+<div style="margin-top:4px;color:{color};font-weight:600">{STATE_ICON[f['site_state']]} {_e(STATE_LABEL[f['site_state']])}</div></div>
+<table style="border-collapse:separate;border-spacing:6px"><tr>{tiles}</tr></table>
+<h3 style="margin:22px 0 6px">Análisis general {'(IA)' if an.get('ai_used') else '(automático)'}</h3>
+<p style="line-height:1.5">{_e(an['text'])}</p>{('<ul>' + rel + '</ul>') if rel else ''}
+{groups_html}{ext_html}{pend_html}{note}
+<hr style="border:none;border-top:1px solid #E2E8F0;margin-top:24px"><p style="font-size:11px;color:#94A3B8">Las direcciones de recursos externos se muestran desarmadas (hxxp / [.]) para evitar clics accidentales.</p>
+</body></html>"""
+
+
+# ------------------------------------------------------------------
+# Tarjeta de Teams (Adaptive Card)
+# ------------------------------------------------------------------
+def teams_payload(report: dict) -> dict:
+    f, an = report["facts"], report["analysis"]
+    s = f["summary"]
+    body = [
+        {"type": "TextBlock", "text": f"{STATE_ICON[f['site_state']]} SAAF Pro — {f['site']['name']}",
+         "weight": "Bolder", "size": "Large", "wrap": True},
+        {"type": "TextBlock", "text": f"{STATE_LABEL[f['site_state']]} · Auditoría #{f['audit']['id']} · {_when(f)}",
+         "isSubtle": True, "spacing": "None", "wrap": True},
+        {"type": "FactSet", "facts": [{"title": lab, "value": str(s[k])} for k, lab in SUMMARY_LINES]},
+        {"type": "TextBlock", "text": "Análisis general" + (" (IA)" if an.get("ai_used") else ""),
+         "weight": "Bolder", "spacing": "Medium"},
+        {"type": "TextBlock", "text": an["text"][:1400], "wrap": True},
+    ]
+    if f["groups"]:
+        body.append({"type": "TextBlock", "text": "Problemas agrupados", "weight": "Bolder", "spacing": "Medium"})
+        for g in f["groups"][:8]:
+            ex = ", ".join(e["page"] for e in g["examples"][:2] if e["page"])
+            body.append({"type": "TextBlock", "wrap": True, "spacing": "Small",
+                         "text": f"• {g['label']}: {g['items']} elemento(s), confianza {g['confidence']}%" + (f" — ej. {ex}" if ex else "")})
+    ext = _ext_sentence(f)
+    if ext:
+        body.append({"type": "TextBlock", "text": ext, "wrap": True, "spacing": "Medium", "isSubtle": True})
+    if f["pending"]:
+        body.append({"type": "TextBlock", "wrap": True, "spacing": "Medium", "color": "Warning",
+                     "text": f"⏳ {len(f['pending'])} elemento(s) pendientes de autorización. Revísalos en el dashboard (🧠 Auditoría IA)."})
+    card = {"$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "type": "AdaptiveCard",
+            "version": "1.4", "body": body}
+    dash = os.environ.get("SAAF_DASHBOARD_URL", "")
+    if dash.startswith(("http://", "https://")):
+        card["actions"] = [{"type": "Action.OpenUrl", "title": "Abrir dashboard", "url": dash}]
+    return {"type": "message",
+            "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "contentUrl": None, "content": card}]}
+
+
+def subject(report: dict) -> str:
+    f = report["facts"]
+    s = f["summary"]
+    return (f"{STATE_ICON[f['site_state']]} SAAF Pro — {f['site']['name']}: {s['alerts']} alerta(s) en "
+            f"{s['groups']} problema(s)" + (f", {s['pending']} pendiente(s)" if s["pending"] else ""))

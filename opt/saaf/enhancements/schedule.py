@@ -17,7 +17,7 @@
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from database import COLOMBIA_TZ, get_all_sites
 
@@ -95,6 +95,56 @@ def describe_days(days: list) -> str:
         return "todos los días"
     names = [cfgmod.WEEKDAY_LABELS[d] for d in days]
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " y " + names[-1]
+
+
+def next_due(days: list, hour: int, minute: int, now: datetime = None):
+    """Proxima fecha/hora en que toca, mirando los proximos 7 dias. None si nunca."""
+    now = now or datetime.now(COLOMBIA_TZ)
+    days = list(days) or list(_DAY_KEYS)
+    for d in range(0, 8):
+        cand = (now + timedelta(days=d)).replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+        if _DAY_KEYS[cand.weekday()] not in days or cand <= now:
+            continue
+        return cand
+    return None
+
+
+def next_audit_at(site_id: int, sch: dict, now: datetime = None):
+    """Proxima auditoria de ESTA campania, o None si la lanza el ciclo general o esta apagada."""
+    if not sch.get("auto_enabled") or sch.get("mode") != "custom":
+        return None
+    return next_due(sch.get("days"), sch.get("hour", 8), sch.get("minute", 0), now)
+
+
+def next_report_at(site_id: int, rep: dict, now: datetime = None):
+    """Proximo envio programado del reporte, o None si va tras cada auditoria o esta apagado."""
+    if rep.get("mode") != "scheduled" or not (rep.get("teams_enabled") or (rep.get("email_enabled") and rep.get("emails"))):
+        return None
+    return next_due(rep.get("days"), rep.get("hour", 9), rep.get("minute", 0), now)
+
+
+def last_audit_fired(site_id: int):
+    """Ultimo dia (YYYY-MM-DD) en que el ticker lanzo la auditoria de esta campania."""
+    return store.kv_get(f"sched_fired:{site_id}") or ""
+
+
+def last_report_fired(site_id: int):
+    return store.kv_get(f"report_fired:{site_id}") or ""
+
+
+def pending_setup(sites: list) -> list:
+    """Campanias que nunca se configuraron: siguen el ciclo general por defecto."""
+    out = []
+    for s in sites or []:
+        sid = s["id"] if "id" in s else None
+        if sid is None:
+            continue
+        try:
+            if not cfgmod.has_custom_config(sid):
+                out.append(s)
+        except Exception:
+            pass
+    return out
 
 
 def describe_schedule(sch: dict) -> str:

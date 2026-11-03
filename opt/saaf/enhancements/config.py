@@ -16,6 +16,10 @@ from database import get_setting, set_setting, get_conn
 from . import store
 from .secrets_store import has_secret, set_secret, get_secret, delete_secret
 
+# Modos de "reflejar en la pantalla Alertas" (ver enhancements/alerts_sync.py).
+# Se declaran aqui para no importar ese modulo desde la configuracion.
+MUTE_MODES = ("off", "legit", "legit_fp")
+
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 WEEKDAY_LABELS = {
     "mon": "Lunes", "tue": "Martes", "wed": "Miércoles", "thu": "Jueves",
@@ -51,7 +55,10 @@ GLOBAL_DEFAULTS = {
     "ai_enabled": True,           # usar IA (si hay ANTHROPIC_API_KEY)
     "max_auto_actions": 25,       # freno de seguridad por auditoria
     "min_auth_confidence": 50,    # por debajo no se pide ni autorizacion
-    "apply_legit_to_alerts": False,  # marcar como omitidas las alertas originales juzgadas legitimas
+    "apply_legit_to_alerts": False,  # (obsoleto) equivale a mute_alerts="legit"
+    # Reflejar el criterio de la auditoria IA en la pantalla ALERTAS original:
+    #   off | legit | legit_fp   (ver enhancements/alerts_sync.py). Reversible.
+    "mute_alerts": "off",
 }
 
 SITE_DEFAULTS = {
@@ -120,6 +127,11 @@ def get_global() -> dict:
     cfg["threshold"] = _clamp_int(cfg.get("threshold"), 0, 100, DEFAULT_THRESHOLD)
     cfg["max_auto_actions"] = _clamp_int(cfg.get("max_auto_actions"), 0, 500, 25)
     cfg["min_auth_confidence"] = _clamp_int(cfg.get("min_auth_confidence"), 0, 100, 50)
+    if cfg.get("mute_alerts") not in MUTE_MODES:
+        cfg["mute_alerts"] = "off"
+    # compatibilidad con el ajuste anterior (booleano)
+    if cfg["mute_alerts"] == "off" and cfg.get("apply_legit_to_alerts"):
+        cfg["mute_alerts"] = "legit"
     return cfg
 
 
@@ -131,6 +143,9 @@ def set_global(**fields) -> dict:
     cur["threshold"] = _clamp_int(cur["threshold"], 0, 100, DEFAULT_THRESHOLD)
     cur["max_auto_actions"] = _clamp_int(cur["max_auto_actions"], 0, 500, 25)
     cur["min_auth_confidence"] = _clamp_int(cur["min_auth_confidence"], 0, 100, 50)
+    if cur.get("mute_alerts") not in MUTE_MODES:
+        cur["mute_alerts"] = "off"
+    cur["apply_legit_to_alerts"] = cur["mute_alerts"] != "off"  # se mantiene por compatibilidad
     set_setting("enh_global", json.dumps(cur))
     return cur
 

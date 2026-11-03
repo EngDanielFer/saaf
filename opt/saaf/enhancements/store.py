@@ -128,6 +128,27 @@ CREATE TABLE IF NOT EXISTS enh_remediations (
     decided_by TEXT,
     decided_at TEXT
 );
+
+-- Alertas ORIGINALES que este paquete marco como omitidas (ignored=1) por
+-- considerarlas validas o falsos positivos. Se guarda para poder deshacerlo:
+-- la tabla threats no se modifica de ninguna otra forma.
+CREATE TABLE IF NOT EXISTS enh_muted_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+    audit_id INTEGER,
+    threat_id INTEGER NOT NULL,
+    fingerprint TEXT,
+    kind TEXT NOT NULL,
+    reason TEXT,
+    page_url TEXT,
+    resource_url TEXT,
+    severity TEXT,
+    confidence INTEGER,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    restored_at TEXT,
+    restored_by TEXT
+);
 """
 
 INDEXES_SQL = """
@@ -139,6 +160,8 @@ CREATE INDEX IF NOT EXISTS idx_enh_state_status ON enh_finding_state(site_id, st
 CREATE INDEX IF NOT EXISTS idx_enh_resources_audit ON enh_resources(site_id, audit_id);
 CREATE INDEX IF NOT EXISTS idx_enh_rem_status ON enh_remediations(status, site_id);
 CREATE INDEX IF NOT EXISTS idx_enh_rem_fp ON enh_remediations(site_id, fingerprint);
+CREATE INDEX IF NOT EXISTS idx_enh_muted ON enh_muted_alerts(status, site_id);
+CREATE INDEX IF NOT EXISTS idx_enh_muted_threat ON enh_muted_alerts(threat_id, status);
 """
 
 _ready = set()

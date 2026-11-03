@@ -22,7 +22,8 @@ for _p in (str(_BASE), str(_BASE / "scripts" / "python")):
 from database import get_all_sites, init_db, to_local_str  # noqa: E402
 
 from enhancements import config as cfgmod  # noqa: E402
-from enhancements import distribution, history, pipeline, remediation, reporting, secrets_store, store  # noqa: E402
+from enhancements import alerts_sync, distribution, history, pipeline, remediation, reporting  # noqa: E402
+from enhancements import secrets_store, store  # noqa: E402
 from enhancements import schedule as sched  # noqa: E402
 from enhancements.wordpress import WPClient, WPError  # noqa: E402
 
@@ -72,9 +73,10 @@ _REQUIRED = {
     "pipeline": ("run_after_audit", "get_report", "list_reports"),
     "distribution": ("dispatch", "send_email", "send_teams", "test_teams"),
     "history": ("apply_history", "STATE_LABEL"),
-    "schedule": ("tick", "start_ticker", "filter_sites_for_cycle"),
+    "schedule": ("tick", "start_ticker", "filter_sites_for_cycle", "next_audit_at", "pending_setup"),
     "links": ("heuristic_verdicts", "summarize", "is_confirmed"),
     "items": ("classify_item", "code_indicators"),
+    "alerts_sync": ("apply_to_alerts", "sweep_open_alerts", "list_muted", "restore", "restore_all", "MODE_LABEL"),
 }
 
 
@@ -120,7 +122,12 @@ def render():
         n_pending = len(remediation.list_remediations(statuses=[remediation.PENDING]))
     except Exception:
         n_pending = 0
-    tabs = st.tabs(["📊 Reportes", f"⏳ Autorizaciones ({n_pending})", "🏢 Campañas", "⚙️ General"])
+    try:
+        n_muted = alerts_sync.count_muted()
+    except Exception:
+        n_muted = 0
+    tabs = st.tabs(["📊 Reportes", f"⏳ Autorizaciones ({n_pending})", "🏢 Campañas",
+                    f"🙈 Alertas omitidas ({n_muted})", "⚙️ General"])
     with tabs[0]:
         _tab_reports(sites)
     with tabs[1]:
@@ -128,6 +135,8 @@ def render():
     with tabs[2]:
         _tab_campaigns(sites)
     with tabs[3]:
+        _tab_muted(sites)
+    with tabs[4]:
         _tab_general(sites)
 
 
@@ -316,13 +325,128 @@ def _tab_authorizations():
 
 
 # =============================================================
+# Alertas omitidas (mejora 3: menos ruido en la pantalla Alertas original)
+# =============================================================
+def _tab_muted(sites):
+    g = cfgmod.get_global()
+    modo = alerts_sync.mode_of(g)
+    st.caption("Aquí se ve qué alertas del sistema original dejó de mostrar la auditoría IA, por qué, y se puede "
+               "deshacer. Se usa el mismo mecanismo que el botón «Omitir» de la pantalla Alertas: nada se borra.")
+    if modo == alerts_sync.OFF:
+        st.info("Ahora mismo la pantalla **Alertas** no se toca. Para que la auditoría IA quite ruido de esa "
+                "pantalla, cambia el ajuste en **General → Reflejar en la pantalla Alertas**.")
+    else:
+        st.success("Ajuste activo: " + alerts_sync.MODE_LABEL[modo])
+        st.caption("Nunca se omite nada CRITICAL ni nada que tenga indicadores (términos de spam, señales fuertes, "
+                   "dominio en lista de spam, huellas de código malicioso o páginas en otro idioma). Tampoco se "
+                   "toca lo que ya estaba omitido por una regla de exclusión o a mano.")
+        with _box():
+            st.markdown("**Revisar las alertas ya acumuladas**")
+            st.caption("Cada auditoría solo revisa sus propios hallazgos. Esto aplica las mismas reglas a las "
+                       "alertas que ya estaban abiertas de auditorías anteriores. Reversible igual que el resto.")
+            c1, c2 = st.columns([3, 1])
+            opciones = {0: "Todas las campañas", **{s["id"]: s["name"] for s in sites}}
+            objetivo = c1.selectbox("Campaña", list(opciones), format_func=lambda i: opciones[i], key="enh_sweep_site")
+            if c2.button("🧹 Revisar ahora", key="enh_sweep_go"):
+                r = alerts_sync.sweep_open_alerts(site_id=objetivo or None, glob=g)
+                _flash("success", f"Se revisaron {r['revisadas']} alerta(s) abiertas y se omitieron {r['muted']}.")
+                st.rerun()
+
+    rows = alerts_sync.list_muted(limit=200)
+    if not rows:
+        st.info("No hay alertas omitidas por la auditoría IA.")
+    else:
+        c1, c2 = st.columns([3, 1])
+        c1.markdown(f"**{len(rows)}** alerta(s) omitida(s).")
+        if c2.button("↩️ Restaurar todas", key="enh_mute_restore_all"):
+            n = alerts_sync.restore_all()
+            _flash("success", f"{n} alerta(s) vuelven a la pantalla Alertas.")
+            st.rerun()
+        for r in rows:
+            with _box():
+                st.markdown(f"**{_esc(r['site_name'])}** — {alerts_sync.KIND_LABEL.get(r['kind'], r['kind'])}  \n"
+                            f"`{_esc(alerts_sync.describe(r))}`")
+                st.caption(f"{_esc(r['severity'] or '')} · confianza {r['confidence']}% · "
+                           f"{to_local_str(r['created_at'])} · {_esc(r['reason'] or '')}")
+                if r.get("threat_ignored") == 0:
+                    st.caption("⚠️ Alguien ya la reactivó desde la pantalla Alertas.")
+                if st.button("↩️ Restaurar", key=f"enh_mute_{r['id']}"):
+                    res = alerts_sync.restore(r["id"])
+                    _flash("success" if res["ok"] else "error", res["message"])
+                    st.rerun()
+
+    done = alerts_sync.list_muted(status=alerts_sync.RESTORED, limit=30)
+    if done:
+        with st.expander(f"Restauradas ({len(done)})"):
+            st.dataframe([{"Campaña": r["site_name"], "Elemento": alerts_sync.describe(r),
+                           "Motivo original": r["reason"], "Restaurada": to_local_str(r["restored_at"])}
+                          for r in done], hide_index=True, use_container_width=True)
+
+
+# =============================================================
 # Campanias
 # =============================================================
+def _fmt_dt(d):
+    return d.strftime("%a %d/%m %H:%M") if d else "—"
+
+
+def _schedule_overview(sites):
+    """Mejora 4: todas las campañas con su programación, lo que falta por configurar y ajuste rápido."""
+    pend = sched.pending_setup(sites)
+    rows = []
+    for s in sites:
+        c = cfgmod.get_site_config(s["id"])
+        sc, rp = c["schedule"], c["report"]
+        proxima = (_fmt_dt(sched.next_audit_at(s["id"], sc)) if sc["mode"] == "custom" and sc["auto_enabled"]
+                   else ("(ciclo general)" if sc["auto_enabled"] else "—"))
+        rows.append({
+            "Campaña": s["name"],
+            "Auditoría": sched.describe_schedule(sc),
+            "Próxima": proxima,
+            "Última propia": sched.last_audit_fired(s["id"]) or "—",
+            "Reporte": "Tras cada auditoría" if rp["mode"] == "after_each_audit"
+            else f"{sched.describe_days(rp['days'])} {rp['hour']:02d}:{rp['minute']:02d}",
+            "Configurada": "No" if any(p["id"] == s["id"] for p in pend) else "Sí",
+        })
+    st.dataframe(rows, hide_index=True, use_container_width=True)
+    st.caption(f"{len(sites)} campaña(s): "
+               f"{sum(1 for r in rows if r['Próxima'] not in ('—', '(ciclo general)'))} con programación propia, "
+               f"{sum(1 for r in rows if r['Próxima'] == '(ciclo general)')} en el ciclo general, "
+               f"{sum(1 for r in rows if r['Próxima'] == '—')} sin auditoría automática. Hora de Colombia.")
+
+    if pend:
+        st.warning(f"**{len(pend)} campaña(s) sin configurar**: " + ", ".join(_esc(p["name"]) for p in pend)
+                   + ". Siguen el ciclo general, como siempre. Si quieres darles días y hora propios, usa el "
+                     "ajuste rápido o la pestaña Programación de cada una.")
+        with st.form("enh_f_bulk_sched"):
+            st.markdown("**Ajuste rápido de programación**")
+            elegidas = st.multiselect("Campañas", [p["id"] for p in pend], default=[p["id"] for p in pend],
+                                      format_func=lambda i: next(p["name"] for p in pend if p["id"] == i),
+                                      key="enh_bulk_sites")
+            dias = st.multiselect("Días", list(cfgmod.WEEKDAYS), default=["mon", "thu"],
+                                  format_func=lambda d: cfgmod.WEEKDAY_LABELS[d], key="enh_bulk_days")
+            hora = st.time_input("Hora (Colombia)", value=_dt.time(8, 0), key="enh_bulk_time")
+            if st.form_submit_button("Aplicar a las campañas elegidas"):
+                if not elegidas or not dias:
+                    st.error("Elige al menos una campaña y un día.")
+                else:
+                    h, m = _time_to_hm(hora)
+                    for i in elegidas:
+                        cfgmod.set_site_config(i, {"schedule": {"mode": "custom", "auto_enabled": True,
+                                                                "days": dias, "hour": h, "minute": m}})
+                    _flash("success", f"Programación aplicada a {len(elegidas)} campaña(s).")
+                    st.rerun()
+    elif sites:
+        st.success("Todas las campañas tienen su programación revisada.")
+
+
 def _time_to_hm(t):
     return t.hour, t.minute
 
 
 def _tab_campaigns(sites):
+    with st.expander(f"🗓️ Programación de todas las campañas ({len(sites)})", expanded=False):
+        _schedule_overview(sites)
     site = _site_picker("enh_cfg_site", sites)
     sid = site["id"]
     cfg = cfgmod.get_site_config(sid)
@@ -516,14 +640,23 @@ def _tab_general(sites):
         mx = st.number_input("Máximo de correcciones automáticas por auditoría", 0, 500, g["max_auto_actions"])
         mn = st.slider("Confianza mínima para pedir autorización (%)", 0, 100, g["min_auth_confidence"],
                        help="Por debajo de este valor el hallazgo solo se informa, sin solicitud.")
-        lg = st.checkbox("Reflejar en las alertas originales los enlaces que la IA juzgó legítimos (severidad baja)",
-                         value=g["apply_legit_to_alerts"],
-                         help="Apagado por defecto: las alertas del sistema original no se tocan.")
+        st.markdown("**Reflejar en la pantalla Alertas**")
+        st.caption("Decide si la pantalla Alertas del sistema original muestra menos ruido. Se usa el mismo "
+                   "mecanismo que su botón «Omitir», se registra todo y se puede deshacer en «Alertas omitidas». "
+                   "Nunca se omite nada CRITICAL ni nada con indicadores.")
+        modos = list(alerts_sync.MODES)
+        mute = st.radio("Qué hacer con las alertas originales", modos,
+                        index=modos.index(alerts_sync.mode_of(g)),
+                        format_func=lambda k: alerts_sync.MODE_LABEL[k], key="enh_mute_mode")
         if st.form_submit_button("Guardar configuración general"):
             cfgmod.set_global(enabled=enabled, threshold=thr, ai_enabled=ai, max_auto_actions=int(mx),
-                              min_auth_confidence=mn, apply_legit_to_alerts=lg)
+                              min_auth_confidence=mn, mute_alerts=mute)
             _flash("success", "Configuración general guardada.")
             st.rerun()
+    if alerts_sync.mode_of(g) != alerts_sync.OFF:
+        st.caption("El correo o SMS de una amenaza nueva lo envía el sistema original antes de este análisis, "
+                   "así que esa primera notificación se manda igual. El efecto se ve en la pantalla desde ese "
+                   "momento, y en las notificaciones de las auditorías siguientes.")
 
     st.markdown("#### Estado del entorno")
     try:

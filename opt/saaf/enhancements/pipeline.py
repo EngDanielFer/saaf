@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 from database import get_conn, get_site, get_spam_domains
 from url_utils import get_host
 
-from . import ai_context, config as cfgmod, distribution, history, items as itm, language, links as lk
+from . import ai_context, alerts_sync, config as cfgmod, distribution, history, items as itm, language, links as lk
 from . import remediation, reporting, store
 from . import taxonomy as tx
 from .log import get_logger
@@ -260,15 +260,13 @@ def run_after_audit(site: dict, site_id: int, audit_id: int, threats: list, html
         log.error("Fallo en el motor de correcciones:\n%s", traceback.format_exc())
         rem_counters = {"auto_applied": 0, "dry_run": 0, "failed": 0, "pending": 0, "skipped": 0}
 
-    # 8) Opcion: reflejar "legitimo" en las alertas originales
-    if glob["apply_legit_to_alerts"]:
-        try:
-            from database import ignore_threat
-            for it in legit_items:
-                if it.get("threat_id") and it.get("severity") in ("LOW", "MEDIUM", "INFO") and it.get("legit_by") == "ia":
-                    ignore_threat(it["threat_id"])
-        except Exception:
-            log.warning("No se pudo marcar alertas legítimas como omitidas", exc_info=True)
+    # 8) Opcion: reflejar el criterio de la auditoria IA en la pantalla Alertas
+    #    original (reversible y registrado; ver enhancements/alerts_sync.py).
+    muted = {"muted": 0, "legit": 0, "false_positive": 0}
+    try:
+        muted = alerts_sync.apply_to_alerts(site_id, audit_id, legit_items + items, glob)
+    except Exception:
+        log.warning("No se pudo reflejar el criterio en las alertas originales", exc_info=True)
 
     # 9) Guardado
     _save_findings(site_id, audit_id, items + legit_items)
@@ -283,6 +281,7 @@ def run_after_audit(site: dict, site_id: int, audit_id: int, threats: list, html
                   "urls_analyzed": a["urls_analyzed"] if a else None}
     facts = reporting.build_facts(db_site, audit_meta, items, link_rows, link_summary, hist_result,
                                   rem_counters, expected_langs, ai_info, legit_items)
+    facts["summary"]["muted_alerts"] = muted["muted"]
     _prev = _previous_summary(site_id, audit_id)
     if _prev:
         facts["history"]["previous_alerts"] = _prev["alerts"]
