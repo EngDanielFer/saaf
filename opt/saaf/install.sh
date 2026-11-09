@@ -63,9 +63,16 @@ twilio==8.10.0
 apscheduler==3.10.4
 reportlab
 anthropic
+playwright>=1.45
 REQEOF
 
 "${PYTHON_VENV}/bin/pip" install --no-cache-dir -r "${SAAF_BASE}/requirements.txt"
+
+# Chromium de Playwright para enviar reportes a Teams (sin webhook). Se instala en una ruta
+# compartida para que el servicio (User=admin_ubuntu) lo encuentre aunque install.sh corra como root.
+export PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+"${PYTHON_VENV}/bin/playwright" install --with-deps chromium || echo "AVISO: no se pudo instalar Chromium de Playwright; el envio a Teams no funcionara hasta instalarlo."
+chmod -R a+rX /opt/ms-playwright 2>/dev/null || true
 
 # ------------------------------------------------------------
 # Node.js con versiones fijadas

@@ -19,6 +19,8 @@
 # fallo y lo pendiente.
 # =============================================================
 
+import os
+
 from database import get_conn
 
 from . import config as cfgmod
@@ -27,7 +29,7 @@ from . import taxonomy as tx
 from .items import norm_page, res_key
 from .log import get_logger
 from .wordpress import (
-    WPClient, WPError, is_front_page, strip_code, strip_links, MAX_CONTENT_BYTES,
+    WPClient, WPError, is_front_page, legit_preserved, kept_hrefs, strip_code, strip_links, MAX_CONTENT_BYTES,
 )
 
 log = get_logger()
@@ -120,11 +122,18 @@ def decide(item: dict, cfg: dict, glob: dict, threshold: int, auto_used: int) ->
 # ------------------------------------------------------------------
 # Ejecucion de una accion sobre WordPress
 # ------------------------------------------------------------------
+def _public_check(client, action, target_url, resource_url, keep) -> dict:
+    if os.environ.get("SAAF_WP_VERIFY_PUBLIC", "1").strip() == "0":
+        return {"ok": None, "detail": "verificación pública desactivada (SAAF_WP_VERIFY_PUBLIC=0)"}
+    return client.verify_public(action, target_url, resource_url, keep_hrefs=keep)
+
+
 def run_action(client: WPClient, site_url: str, action: str, target_url: str,
                resource_url: str = "", hint_id: int = None, dry_run: bool = False) -> dict:
-    """Devuelve {'status','message','wp_id','rest_base','backup','prev_status'}."""
+    """Devuelve {'status','message','wp_id','rest_base','backup','prev_status','verification'}.
+    APPLIED solo si la correccion se COMPROBO (contenido releido y, cuando se puede, la pagina publica)."""
     out = {"status": FAILED, "message": "", "wp_id": None, "rest_base": None,
-           "backup": None, "prev_status": None}
+           "backup": None, "prev_status": None, "verification": None}
     try:
         if is_front_page(site_url, target_url):
             out["message"] = "La portada está protegida: no se modifica automáticamente."
@@ -144,8 +153,18 @@ def run_action(client: WPClient, site_url: str, action: str, target_url: str,
             if dry_run:
                 out.update(status=DRY_RUN, message=f"Simulación: se enviaría a la papelera ({post['rest_base']} #{post['id']}).")
                 return out
-            client.trash(post["rest_base"], post["id"])
-            out.update(status=APPLIED, message=f"Enviado a la papelera ({post['rest_base']} #{post['id']}). Reversible desde WordPress.")
+            t = client.trash(post["rest_base"], post["id"])
+            if t.get("status") not in (None, "trash"):
+                out["message"] = f"WordPress no dejó la página en la papelera (estado: {t.get('status')})."
+                return out
+            pub = _public_check(client, "trash_post", target_url, "", ())
+            out["verification"] = pub
+            if pub["ok"] is False:
+                out.update(status=FAILED, message=f"Se envió a la papelera ({post['rest_base']} #{post['id']}) pero NO se pudo comprobar "
+                                                  f"que desapareciera: {pub['detail']}.")
+                return out
+            note = "Verificado: " + pub["detail"] + "." if pub["ok"] else "Aviso: " + pub["detail"] + "."
+            out.update(status=APPLIED, message=f"Enviado a la papelera ({post['rest_base']} #{post['id']}). {note} Reversible desde WordPress.")
             return out
 
         if action in ("remove_link", "remove_code"):
@@ -176,7 +195,22 @@ def run_action(client: WPClient, site_url: str, action: str, target_url: str,
                 client.set_content(post["rest_base"], post["id"], raw)  # deshacer
                 out.update(status=FAILED, message="WordPress no conservó el cambio; se restauró el contenido original.", backup=None)
                 return out
-            out.update(status=APPLIED, message=f"Se retiraron {n} elemento(s) del contenido ({post['rest_base']} #{post['id']}). Copia guardada para revertir.")
+            # Contenido legitimo intacto: todo enlace/script/iframe que no era el inyectado debe seguir ahi.
+            ok_keep, lost = legit_preserved(raw, check, resource_url)
+            if not ok_keep:
+                client.set_content(post["rest_base"], post["id"], raw)  # deshacer
+                out.update(status=FAILED, backup=None,
+                           message="Se canceló y restauró el original: la edición habría quitado contenido legítimo (" + ", ".join(lost[:3]) + ").")
+                return out
+            pub = _public_check(client, action, target_url, resource_url, kept_hrefs(raw, resource_url)[:10])
+            out["verification"] = pub
+            if pub["ok"] is False:
+                out.update(status=FAILED, message=f"Se retiró {n} elemento(s) del contenido ({post['rest_base']} #{post['id']}) pero NO se "
+                                                  f"comprobó el resultado: {pub['detail']}. El contenido editable ya está limpio; "
+                                                  "revisa caché, tema, widgets o plugins.")
+                return out
+            note = "Verificado: " + pub["detail"] + "." if pub["ok"] else "Aviso: " + pub["detail"] + "."
+            out.update(status=APPLIED, message=f"Se retiraron {n} elemento(s) del contenido ({post['rest_base']} #{post['id']}). {note} Copia guardada para revertir.")
             return out
 
         out["message"] = f"Acción desconocida: {action}"

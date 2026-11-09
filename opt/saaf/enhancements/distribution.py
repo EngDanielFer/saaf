@@ -2,9 +2,10 @@
 # SAAF Pro — enhancements/distribution.py
 # Envio de reportes por campania a Microsoft Teams y a correos propios.
 #
-# * Teams: Webhook entrante / flujo de Power Automate ("Cuando se recibe una
-#   solicitud de webhook de Teams") con una tarjeta adaptable. La URL del
-#   webhook es un secreto (secrets_store), nunca se muestra ni se registra.
+# * Teams: SIN webhook ni Power Automate. Una cuenta de usuario normal inicia
+#   sesion una vez en un perfil de Chromium propio y el servicio publica el
+#   reporte en el chat/canal con Playwright (enhancements/teams_browser.py).
+#   Cada envio se VERIFICA leyendo el mensaje en el propio chat.
 # * Correo: usa el MISMO SMTP configurado en saaf.env (SAAF_SMTP_*) que ya
 #   usan las alertas, pero con destinatarios propios de cada campania y
 #   formato HTML (con alternativa en texto plano). No modifica alerts.py.
@@ -15,10 +16,8 @@ import smtplib
 from email.message import EmailMessage
 from urllib.parse import urlparse
 
-import requests
-
 from . import config as cfgmod
-from . import reporting
+from . import reporting, store, teams_browser
 from .log import get_logger
 
 log = get_logger()
@@ -72,44 +71,60 @@ def send_email(to: str, subject: str, text: str, html: str = None) -> tuple:
         return False, f"{e.__class__.__name__}: {str(e)[:120]}"
 
 
-def valid_webhook(url: str) -> bool:
+SESSION_ALERT_EVERY_H = 12
+
+
+def teams_ready(site_id: int) -> tuple:
+    rc = cfgmod.get_site_config(site_id)["report"]
+    if not (rc["teams_chat_url"] or rc["teams_chat_name"]):
+        return False, "Falta el enlace o el nombre del chat/canal de Teams (Campañas → Reportes)."
+    return teams_browser.playwright_ready()
+
+
+def _notify_session_problem(site_id: int, res: dict):
+    """Avisa por correo (como mucho cada 12 h) cuando la sesion de Teams caduco, para que no pase desapercibido."""
+    if res.get("code") != teams_browser.SESSION_EXPIRED:
+        return
+    key = f"teams_session_alert:{site_id}"
     try:
-        u = urlparse(url or "")
-        return u.scheme == "https" and bool(u.netloc)
+        last = store.kv_get(key)
+        if last:
+            from datetime import datetime, timezone
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() / 3600
+            if age < SESSION_ALERT_EVERY_H:
+                return
+        cfg = cfgmod.get_site_config(site_id)["report"]
+        to = cfg["emails"] or [e.strip() for e in os.environ.get("SAAF_ALERT_RECIPIENTS", "").split(",") if e.strip()]
+        sent = False
+        for addr in to:
+            ok, _ = send_email(addr, "SAAF Pro — la sesión de Teams caducó",
+                               "Los reportes a Microsoft Teams no se están entregando porque la sesión de la cuenta caducó "
+                               "o Microsoft pidió autenticarse de nuevo.\n\nSolución: en el servidor ejecuta\n"
+                               "  venv/bin/python opt/saaf/scripts/python/teams_login.py\ne inicia sesión (con MFA) una vez.")
+            sent = sent or ok
+        if sent:
+            from datetime import datetime, timezone
+            store.kv_set(key, datetime.now(timezone.utc).isoformat())
     except Exception:
-        return False
+        log.warning("No se pudo avisar de la caducidad de la sesión de Teams", exc_info=True)
 
 
-def send_teams(webhook_url: str, payload: dict) -> tuple:
-    """(ok, error). Nunca lanza ni registra la URL."""
-    if not valid_webhook(webhook_url):
-        return False, "La URL del webhook de Teams debe empezar con https://"
-    try:
-        r = requests.post(webhook_url, json=payload, timeout=NETWORK_TIMEOUT_S)
-        if r.status_code in (200, 201, 202):
-            return True, ""
-        return False, f"Teams respondió HTTP {r.status_code}: {r.text[:120]}"
-    except requests.RequestException as e:
-        return False, f"{e.__class__.__name__}"
+def _teams_result(res: dict, rc: dict) -> dict:
+    return {"channel": "teams", "target": rc.get("teams_chat_name") or "chat de Teams", "ok": bool(res.get("ok")),
+            "verified": bool(res.get("verified")), "code": res.get("code"), "error": res.get("error", ""),
+            "marker": res.get("marker"), "proof": res.get("proof", ""), "attempts": res.get("attempts", 0)}
 
 
-def test_teams(site_id: int) -> tuple:
-    url = cfgmod.get_teams_webhook(site_id)
-    if not url:
-        return False, "No hay webhook de Teams guardado para esta campaña."
-    payload = {
-        "type": "message",
-        "attachments": [{
-            "contentType": "application/vnd.microsoft.card.adaptive", "contentUrl": None,
-            "content": {"$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "type": "AdaptiveCard",
-                        "version": "1.4",
-                        "body": [{"type": "TextBlock", "text": "✅ SAAF Pro — prueba de conexión con Teams",
-                                  "weight": "Bolder", "wrap": True},
-                                 {"type": "TextBlock", "text": "Si ves este mensaje, los reportes de esta campaña llegarán a este canal.",
-                                  "wrap": True}]},
-        }],
-    }
-    return send_teams(url, payload)
+def test_teams(site_id: int) -> dict:
+    """Envia un mensaje de prueba REAL al chat y verifica que aparece. Devuelve el resultado completo."""
+    rc = cfgmod.get_site_config(site_id)["report"]
+    marker = teams_browser.new_marker("SAAF-PRUEBA")
+    res = teams_browser.send_message(
+        rc["teams_chat_url"], rc["teams_chat_name"],
+        ["✅ SAAF Pro — prueba de conexión con Teams",
+         "Si ves este mensaje, los reportes de esta campaña llegarán a este chat."], marker=marker)
+    _notify_session_problem(site_id, res)
+    return _teams_result(res, rc)
 
 
 def dispatch(site_id: int, report: dict, force: bool = False) -> list:
@@ -126,12 +141,14 @@ def dispatch(site_id: int, report: dict, force: bool = False) -> list:
         return [{"channel": "-", "target": "-", "ok": True, "error": "omitido: sin alertas importantes ni pendientes"}]
 
     if cfg["teams_enabled"]:
-        url = cfgmod.get_teams_webhook(site_id)
-        if url:
-            ok, err = send_teams(url, reporting.teams_payload(report))
-            results.append({"channel": "teams", "target": "webhook", "ok": ok, "error": err})
+        ok_t, why = teams_ready(site_id)
+        if not ok_t:
+            results.append({"channel": "teams", "target": cfg.get("teams_chat_name") or "chat de Teams", "ok": False,
+                            "verified": False, "code": "CONFIG", "error": why})
         else:
-            results.append({"channel": "teams", "target": "webhook", "ok": False, "error": "falta la URL del webhook"})
+            res = teams_browser.send_message(cfg["teams_chat_url"], cfg["teams_chat_name"], reporting.teams_lines(report))
+            _notify_session_problem(site_id, res)
+            results.append(_teams_result(res, cfg))
     if cfg["email_enabled"] and cfg["emails"]:
         subj, text, html = reporting.subject(report), reporting.render_text(report), reporting.render_html(report)
         for to in cfg["emails"]:
@@ -139,5 +156,5 @@ def dispatch(site_id: int, report: dict, force: bool = False) -> list:
             results.append({"channel": "email", "target": to, "ok": ok, "error": err})
     for r in results:
         log.info("Reporte campaña %s -> %s %s: %s", site_id, r["channel"], r["target"] if r["channel"] == "email" else "",
-                 "ok" if r["ok"] else r["error"])
+                 ("ok" + (" (verificado en Teams)" if r.get("verified") else "")) if r["ok"] else r["error"])
     return results

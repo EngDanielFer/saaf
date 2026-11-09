@@ -13,7 +13,10 @@
 #   * Nunca se toca la portada ni una URL de otro dominio.
 # =============================================================
 
+import os
 import re
+import time
+from collections import Counter
 from urllib.parse import urlparse
 
 import requests
@@ -234,6 +237,53 @@ class WPClient:
             return {"ok": True}
         raise WPError(self._err(r, "No se pudo guardar el contenido"), r.status_code)
 
+    # ---------------------------------------------------------- verificacion en la pagina PUBLICA
+    def fetch_public(self, url: str):
+        """GET anonimo de la pagina publica saltandose cachés (parametro unico). -> (http_status, html)."""
+        sep = "&" if "?" in url else "?"
+        try:
+            r = requests.get(f"{url}{sep}saaf_verify={int(time.time() * 1000)}", timeout=self.timeout,
+                             headers={"User-Agent": UA, "Cache-Control": "no-cache", "Pragma": "no-cache"},
+                             allow_redirects=True)
+            return r.status_code, r.text or ""
+        except requests.RequestException:
+            return None, ""
+
+    def verify_public(self, action: str, page_url: str, resource_url: str = "", keep_hrefs=(),
+                      tries: int = None, delay: float = None) -> dict:
+        """
+        Comprueba en la pagina que ve cualquier visitante que la correccion surtio efecto:
+          trash_post            -> la URL ya no responde 200 (404/410) o ya no es la misma pagina
+          remove_link/code      -> el HTML publico ya no referencia el recurso y conserva los enlaces legitimos
+        Devuelve {'ok': True|False|None, 'detail': str}; None = no se pudo comprobar (red).
+        """
+        tries = int(os.environ.get("SAAF_WP_VERIFY_TRIES", "3")) if tries is None else tries
+        delay = float(os.environ.get("SAAF_WP_VERIFY_DELAY", "3")) if delay is None else delay
+        last = {"ok": None, "detail": "no se pudo consultar la página pública"}
+        for i in range(max(1, tries)):
+            if i:
+                time.sleep(delay)
+            status, html = self.fetch_public(page_url)
+            if status is None:
+                continue
+            if action == "trash_post":
+                if status in (404, 410):
+                    return {"ok": True, "detail": f"la página pública responde HTTP {status}"}
+                last = {"ok": False, "detail": f"la página pública sigue respondiendo HTTP {status} (¿caché del sitio?)"}
+                continue
+            if status >= 400:
+                last = {"ok": None, "detail": f"la página pública respondió HTTP {status}"}
+                continue
+            if public_references(html, resource_url):
+                last = {"ok": False, "detail": "el recurso sigue apareciendo en el HTML público (¿caché, tema, widget o plugin?)"}
+                continue
+            missing = [h for h in keep_hrefs if h and h not in html]
+            if missing:
+                return {"ok": False, "detail": "tras la corrección faltan enlaces legítimos en la página pública: "
+                                               + ", ".join(missing[:3])}
+            return {"ok": True, "detail": "el recurso ya no aparece en el HTML público y el contenido legítimo sigue ahí"}
+        return last
+
 
 # =============================================================
 # Edicion segura de contenido (funciones puras)
@@ -298,3 +348,33 @@ def extract_post_id(html: str):
         re.search(r"<link[^>]+href=[\"'][^\"']*[?&]p=(\d+)[\"'][^>]+rel=[\"']shortlink", html, re.I) or \
         re.search(r"<body[^>]+class=[\"'][^\"']*\b(?:postid|page-id)-(\d+)", html, re.I)
     return int(m.group(1)) if m else None
+
+
+def public_references(html: str, resource_url: str) -> bool:
+    """True si el HTML publico enlaza/carga `resource_url` (a, script o iframe)."""
+    if not resource_url:
+        return False
+    for rx in (_A_RE, _SCRIPT_RE, _IFRAME_RE):
+        for m in rx.finditer(html or ""):
+            if _res_matches(m.group("href"), resource_url):
+                return True
+    # etiquetas <link>/<img> o enlaces fuera de patron
+    for m in re.finditer(r"(?:href|src)\s*=\s*([\"'])(.*?)\1", html or "", re.I | re.S):
+        if _res_matches(m.group(2), resource_url):
+            return True
+    return False
+
+
+def kept_hrefs(raw: str, resource_url: str) -> list:
+    """href/src de a, script e iframe que NO apuntan a `resource_url` (lo legitimo que debe sobrevivir)."""
+    out = []
+    for rx in (_A_RE, _SCRIPT_RE, _IFRAME_RE):
+        out += [m.group("href") for m in rx.finditer(raw or "") if not _res_matches(m.group("href"), resource_url)]
+    return out
+
+
+def legit_preserved(before: str, after: str, resource_url: str) -> tuple:
+    """(ok, faltantes): todo enlace/script/iframe que no es el retirado sigue en `after`."""
+    need, have = Counter(kept_hrefs(before, resource_url)), Counter(kept_hrefs(after, resource_url))
+    missing = [h for h, n in need.items() if have.get(h, 0) < n]
+    return (not missing), missing

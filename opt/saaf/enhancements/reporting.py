@@ -388,40 +388,31 @@ def render_html(report: dict) -> str:
 
 
 # ------------------------------------------------------------------
-# Tarjeta de Teams (Adaptive Card)
+# Mensaje de Teams (texto plano, sin tarjeta ni webhook)
 # ------------------------------------------------------------------
-def teams_payload(report: dict) -> dict:
+def teams_lines(report: dict) -> list:
+    """Lineas del mensaje que se escribe en el chat de Teams (se envia con teams_browser)."""
     f, an = report["facts"], report["analysis"]
     s = f["summary"]
-    body = [
-        {"type": "TextBlock", "text": f"{STATE_ICON[f['site_state']]} SAAF Pro — {f['site']['name']}",
-         "weight": "Bolder", "size": "Large", "wrap": True},
-        {"type": "TextBlock", "text": f"{STATE_LABEL[f['site_state']]} · Auditoría #{f['audit']['id']} · {_when(f)}",
-         "isSubtle": True, "spacing": "None", "wrap": True},
-        {"type": "FactSet", "facts": [{"title": lab, "value": str(s[k])} for k, lab in SUMMARY_LINES]},
-        {"type": "TextBlock", "text": "Análisis general" + (" (IA)" if an.get("ai_used") else ""),
-         "weight": "Bolder", "spacing": "Medium"},
-        {"type": "TextBlock", "text": an["text"][:1400], "wrap": True},
-    ]
+    L = [f"{STATE_ICON[f['site_state']]} SAAF Pro — {f['site']['name']}",
+         f"{STATE_LABEL[f['site_state']]} · Auditoría #{f['audit']['id']} · {_when(f)}", ""]
+    for k, lab in SUMMARY_LINES:
+        L.append(f"• {lab}: {s[k]}")
+    L += ["", "Análisis general" + (" (IA)" if an.get("ai_used") else ""), an["text"][:1400]]
     if f["groups"]:
-        body.append({"type": "TextBlock", "text": "Problemas agrupados", "weight": "Bolder", "spacing": "Medium"})
+        L += ["", "Problemas agrupados"]
         for g in f["groups"][:8]:
             ex = ", ".join(e["page"] for e in g["examples"][:2] if e["page"])
-            body.append({"type": "TextBlock", "wrap": True, "spacing": "Small",
-                         "text": f"• {g['label']}: {g['items']} elemento(s), confianza {g['confidence']}%" + (f" — ej. {ex}" if ex else "")})
+            L.append(f"• {g['label']}: {g['items']} elemento(s), confianza {g['confidence']}%" + (f" — ej. {ex}" if ex else ""))
     ext = _ext_sentence(f)
     if ext:
-        body.append({"type": "TextBlock", "text": ext, "wrap": True, "spacing": "Medium", "isSubtle": True})
+        L += ["", ext]
     if f["pending"]:
-        body.append({"type": "TextBlock", "wrap": True, "spacing": "Medium", "color": "Warning",
-                     "text": f"⏳ {len(f['pending'])} elemento(s) pendientes de autorización. Revísalos en el dashboard (🧠 Auditoría IA)."})
-    card = {"$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "type": "AdaptiveCard",
-            "version": "1.4", "body": body}
+        L += ["", f"⏳ {len(f['pending'])} elemento(s) pendientes de autorización. Revísalos en el dashboard (Auditoría IA)."]
     dash = os.environ.get("SAAF_DASHBOARD_URL", "")
     if dash.startswith(("http://", "https://")):
-        card["actions"] = [{"type": "Action.OpenUrl", "title": "Abrir dashboard", "url": dash}]
-    return {"type": "message",
-            "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "contentUrl": None, "content": card}]}
+        L += ["", "Dashboard: " + defang(dash)]
+    return L
 
 
 def subject(report: dict) -> str:

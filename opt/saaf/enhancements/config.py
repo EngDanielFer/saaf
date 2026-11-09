@@ -71,6 +71,8 @@ SITE_DEFAULTS = {
     },
     "report": {
         "teams_enabled": False,
+        "teams_chat_url": "",         # enlace del chat/canal (Teams: «Copiar vínculo»); sin webhook
+        "teams_chat_name": "",        # nombre esperado del chat: si no coincide, NO se envía
         "emails": [],
         "email_enabled": False,
         "mode": "after_each_audit",   # after_each_audit | scheduled
@@ -207,6 +209,8 @@ def normalize_site_config(cfg: dict) -> dict:
     s["minute"] = _clamp_int(s.get("minute"), 0, 59, 0)
 
     r["teams_enabled"] = bool(r.get("teams_enabled"))
+    r["teams_chat_url"] = (r.get("teams_chat_url") or "").strip()[:1500]
+    r["teams_chat_name"] = re.sub(r"\s+", " ", (r.get("teams_chat_name") or "")).strip()[:120]
     r["email_enabled"] = bool(r.get("email_enabled"))
     r["emails"] = parse_emails(r.get("emails"))
     r["mode"] = r.get("mode") if r.get("mode") in ("after_each_audit", "scheduled") else "after_each_audit"
@@ -280,10 +284,6 @@ def _wp_key(site_id):
     return f"wp_password:{site_id}"
 
 
-def _teams_key(site_id):
-    return f"teams_webhook:{site_id}"
-
-
 def set_wp_password(site_id, value):
     set_secret(_wp_key(site_id), value)
 
@@ -298,19 +298,3 @@ def has_wp_password(site_id) -> bool:
 
 def clear_wp_password(site_id):
     delete_secret(_wp_key(site_id))
-
-
-def set_teams_webhook(site_id, value):
-    set_secret(_teams_key(site_id), value)
-
-
-def get_teams_webhook(site_id):
-    return get_secret(_teams_key(site_id))
-
-
-def has_teams_webhook(site_id) -> bool:
-    return has_secret(_teams_key(site_id))
-
-
-def clear_teams_webhook(site_id):
-    delete_secret(_teams_key(site_id))

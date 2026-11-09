@@ -22,7 +22,7 @@ for _p in (str(_BASE), str(_BASE / "scripts" / "python")):
 from database import get_all_sites, init_db, to_local_str  # noqa: E402
 
 from enhancements import config as cfgmod  # noqa: E402
-from enhancements import alerts_sync, distribution, history, pipeline, remediation, reporting  # noqa: E402
+from enhancements import alerts_sync, distribution, history, pipeline, remediation, reporting, teams_browser  # noqa: E402
 from enhancements import secrets_store, store  # noqa: E402
 from enhancements import schedule as sched  # noqa: E402
 from enhancements.wordpress import WPClient, WPError  # noqa: E402
@@ -68,10 +68,11 @@ def _site_picker(key: str, sites):
 # =============================================================
 # Funciones que cada modulo debe exponer: detecta archivos mal copiados (p. ej. dos módulos con el mismo contenido).
 _REQUIRED = {
-    "reporting": ("build_facts", "render_text", "render_html", "teams_payload", "defang", "SUMMARY_LINES"),
+    "reporting": ("build_facts", "render_text", "render_html", "teams_lines", "defang", "SUMMARY_LINES"),
     "remediation": ("process_items", "authorize", "reject", "revert", "list_remediations", "decide"),
     "pipeline": ("run_after_audit", "get_report", "list_reports"),
-    "distribution": ("dispatch", "send_email", "send_teams", "test_teams"),
+    "distribution": ("dispatch", "send_email", "teams_ready", "test_teams"),
+    "teams_browser": ("send_message", "session_status", "prepare_lines", "profile_lock"),
     "history": ("apply_history", "STATE_LABEL"),
     "schedule": ("tick", "start_ticker", "filter_sites_for_cycle", "next_audit_at", "pending_setup"),
     "links": ("heuristic_verdicts", "summarize", "is_confirmed"),
@@ -251,8 +252,10 @@ def _tab_reports(sites):
     st.markdown("#### Envío del reporte")
     if row["dispatch"]:
         for d in row["dispatch"]:
-            st.write(("✅ " if d["ok"] else "❌ ") + f"{d['channel']} {d['target'] if d['channel'] == 'email' else ''}"
-                     + (f" — {_esc(d['error'])}" if d.get("error") else ""))
+            ver = " — recibido y verificado en Teams" + (f" (ref. {d['marker']})" if d.get("marker") else "") \
+                if d.get("channel") == "teams" and d.get("verified") else ""
+            st.write(("✅ " if d["ok"] else "❌ ") + f"{d['channel']} {d['target'] if d['channel'] in ('email', 'teams') else ''}"
+                     + ver + (f" — {_esc(d['error'])}" if d.get("error") else ""))
     else:
         st.caption("Este reporte no se envió (la campaña no tiene Teams/correo configurados o se envía en un día programado).")
 
@@ -482,11 +485,14 @@ def _tab_campaigns(sites):
         rc = cfg["report"]
         st.caption("A dónde y cuándo se envía el reporte. Es independiente de la frecuencia de auditoría.")
         with st.form(f"enh_f_rep_{sid}"):
-            teams_on = st.checkbox("Enviar a Microsoft Teams", value=rc["teams_enabled"])
-            has_hook = cfgmod.has_teams_webhook(sid)
-            hook = st.text_input("URL del webhook de Teams / flujo de Power Automate", type="password",
-                                 placeholder="Guardado ✔ — deja vacío para conservarlo" if has_hook else "https://...")
-            drop_hook = st.checkbox("Borrar el webhook guardado") if has_hook else False
+            teams_on = st.checkbox("Enviar a Microsoft Teams (cuenta de usuario con sesión iniciada, sin webhook)",
+                                   value=rc["teams_enabled"])
+            t_url = st.text_input("Enlace del chat o canal de Teams",
+                                  value=rc["teams_chat_url"], placeholder="https://teams.microsoft.com/l/chat/…",
+                                  help="En Teams: clic derecho sobre el chat/canal → «Copiar vínculo».")
+            t_name = st.text_input("Nombre del chat o canal (control de seguridad)", value=rc["teams_chat_name"],
+                                   help="Si se indica, solo se envía cuando el chat abierto tiene este nombre. "
+                                        "Sin enlace, se busca el chat por este nombre en la lista de Teams.")
             mail_on = st.checkbox("Enviar por correo", value=rc["email_enabled"])
             emails = st.text_area("Correos (uno o varios, separados por coma o salto de línea)",
                                   value="\n".join(rc["emails"]))
@@ -503,25 +509,30 @@ def _tab_campaigns(sites):
                 bad = cfgmod.invalid_emails(emails)
                 if bad:
                     st.error("Correos con formato inválido: " + ", ".join(bad))
-                elif hook.strip() and not distribution.valid_webhook(hook.strip()):
-                    st.error("El webhook debe empezar con https://")
+                elif teams_on and not (t_url.strip() or t_name.strip()):
+                    st.error("Indica el enlace o el nombre del chat/canal de Teams.")
+                elif t_url.strip() and not teams_browser.valid_chat_url(t_url):
+                    st.error("El enlace debe ser de Teams (https://teams.microsoft.com/…).")
                 elif rmode == "scheduled" and not rdays:
                     st.error("Elige al menos un día de envío.")
                 else:
-                    if hook.strip():
-                        cfgmod.set_teams_webhook(sid, hook.strip())
-                    elif drop_hook:
-                        cfgmod.clear_teams_webhook(sid)
                     h, m = _time_to_hm(rtm)
                     cfgmod.set_site_config(sid, {"report": {
-                        "teams_enabled": teams_on, "email_enabled": mail_on, "emails": cfgmod.parse_emails(emails),
+                        "teams_enabled": teams_on, "teams_chat_url": t_url.strip(), "teams_chat_name": t_name.strip(),
+                        "email_enabled": mail_on, "emails": cfgmod.parse_emails(emails),
                         "mode": rmode, "days": rdays or ["mon"], "hour": h, "minute": m, "only_if_important": only_imp}})
                     _flash("success", "Configuración de reportes guardada.")
                     st.rerun()
         c1, c2, c3 = st.columns(3)
         if c1.button("Probar Teams", key=f"enh_tt_{sid}"):
-            ok, err = distribution.test_teams(sid)
-            st.success("Mensaje de prueba enviado a Teams.") if ok else st.error(err)
+            with st.spinner("Enviando un mensaje de prueba y comprobando que llegó a Teams (puede tardar ~1 min)…"):
+                tr = distribution.test_teams(sid)
+            if tr["ok"] and tr["verified"]:
+                st.success(f"✅ Mensaje recibido y verificado en Teams (ref. {tr['marker']}).")
+                if tr.get("proof"):
+                    st.caption("Captura de evidencia: " + _esc(tr["proof"]))
+            else:
+                st.error(f"❌ No se pudo comprobar la entrega en Teams: {tr['error']} [{tr['code']}]")
         if c2.button("Probar correo", key=f"enh_tm_{sid}"):
             to = cfgmod.get_site_config(sid)["report"]["emails"]
             if not to:
@@ -543,11 +554,19 @@ def _tab_campaigns(sites):
                 if not res:
                     st.warning("No hay Teams ni correos configurados.")
                 for d in res:
-                    st.write(("✅ " if d["ok"] else "❌ ") + f"{d['channel']} {d['target'] if d['channel'] == 'email' else ''} "
-                             + _esc(d.get("error") or ""))
+                    st.write(("✅ " if d["ok"] else "❌ ") + f"{d['channel']} {d['target'] if d['channel'] in ('email', 'teams') else ''} "
+                         + ("(verificado en Teams) " if d.get("verified") else "") + _esc(d.get("error") or ""))
         ok, why = distribution.email_ready()
         if not ok:
             st.caption("ℹ️ " + why)
+        with st.expander("🔐 Sesión de Teams (cuenta que publica los reportes)"):
+            st.caption("Los reportes se publican con una cuenta normal de Teams que tenga permiso para escribir en el chat. "
+                       "La sesión se inicia UNA vez, a mano y con MFA, en el servidor:  "
+                       "`venv/bin/python opt/saaf/scripts/python/teams_login.py`. SAAF no guarda la contraseña ni evita el MFA.")
+            if st.button("Comprobar sesión de Teams", key=f"enh_ts_{sid}"):
+                with st.spinner("Comprobando…"):
+                    ss = teams_browser.session_status()
+                {"ok": st.success, "expired": st.error, "none": st.warning}.get(ss["state"], st.info)(ss["message"])
 
     # ---------------- IA
     with t_ai:
