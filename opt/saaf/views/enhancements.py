@@ -525,8 +525,9 @@ def _tab_campaigns(sites):
                     st.rerun()
         c1, c2, c3 = st.columns(3)
         if c1.button("Probar Teams", key=f"enh_tt_{sid}"):
-            with st.spinner("Enviando un mensaje de prueba y comprobando que llegó a Teams (puede tardar ~1 min)…"):
-                tr = distribution.test_teams(sid)
+            with st.status("Enviando mensaje de prueba a Teams…", expanded=True) as stt:
+                tr = distribution.test_teams(sid, progress=lambda m: stt.write(_esc(m)))
+                stt.update(label="Listo" if tr["ok"] else "Falló", state="complete" if tr["ok"] else "error")
             if tr["ok"] and tr["verified"]:
                 st.success(f"✅ Mensaje recibido y verificado en Teams (ref. {tr['marker']}).")
                 if tr.get("proof"):
@@ -565,7 +566,7 @@ def _tab_campaigns(sites):
                        "`venv/bin/python opt/saaf/scripts/python/teams_login.py`. SAAF no guarda la contraseña ni evita el MFA.")
             if st.button("Comprobar sesión de Teams", key=f"enh_ts_{sid}"):
                 with st.spinner("Comprobando…"):
-                    ss = teams_browser.session_status()
+                    ss = teams_browser.session_status(rc['teams_chat_url'])
                 {"ok": st.success, "expired": st.error, "none": st.warning}.get(ss["state"], st.info)(ss["message"])
 
     # ---------------- IA

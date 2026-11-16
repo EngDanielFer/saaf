@@ -23,6 +23,7 @@ import contextlib
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -37,11 +38,30 @@ PROOF_DIR = Path(os.environ.get("SAAF_TEAMS_PROOF_DIR", str(LOG_DIR / "teams_pro
 CHROMIUM_PATH = os.environ.get("SAAF_CHROMIUM_PATH", "").strip() or None
 HEADLESS = os.environ.get("SAAF_TEAMS_HEADLESS", "1").strip() != "0"
 NAV_TIMEOUT_MS = int(float(os.environ.get("SAAF_TEAMS_NAV_TIMEOUT", "60")) * 1000)
-VERIFY_TIMEOUT_S = float(os.environ.get("SAAF_TEAMS_VERIFY_TIMEOUT", "25"))
+VERIFY_TIMEOUT_S = float(os.environ.get("SAAF_TEAMS_VERIFY_TIMEOUT", "40"))
 LOCK_WAIT_S = float(os.environ.get("SAAF_TEAMS_LOCK_WAIT", "180"))
 MAX_ATTEMPTS = int(os.environ.get("SAAF_TEAMS_ATTEMPTS", "3"))
 MAX_CHARS = 6000
 TEAMS_URL = "https://teams.microsoft.com/v2/"
+
+
+def home_url(chat_url: str = "") -> str:
+    """Pagina de inicio de Teams del MISMO dominio que el chat: la sesion de teams.live.com (cuenta personal)
+    y la de teams.microsoft.com (cuenta de trabajo/escuela) son distintas."""
+    host = (urlparse(chat_url or "").hostname or "").lower()
+    if host.endswith("teams.live.com"):
+        return "https://teams.live.com/v2/"
+    if host.endswith("teams.cloud.microsoft"):
+        return "https://teams.cloud.microsoft/"
+    return TEAMS_URL
+
+
+def _login_msg(page) -> str:
+    try:
+        host = urlparse(page.url).hostname or "?"
+    except Exception:
+        host = "?"
+    return f"Teams pide iniciar sesión de nuevo (página: {host}). Ejecuta teams_login.py con --chat-url del mismo enlace."
 
 TEAMS_HOSTS = ("teams.microsoft.com", "teams.cloud.microsoft", "teams.live.com")
 LOGIN_HOSTS = ("login.microsoftonline.com", "login.live.com", "login.microsoft.com", "account.live.com",
@@ -103,6 +123,22 @@ _load_selector_overrides()
 # ------------------------------------------------------------------
 # Validacion de destino y texto
 # ------------------------------------------------------------------
+_tl = threading.local()
+
+
+def _say(msg: str):
+    """Registra un paso del envio (enhancements.log) y lo muestra si hay un callback de progreso."""
+    t0 = getattr(_tl, "t0", None)
+    line = f"[{time.time() - t0:5.1f}s] {msg}" if t0 else msg
+    log.info("Teams: %s", line)
+    cb = getattr(_tl, "cb", None)
+    if cb:
+        try:
+            cb(line)
+        except Exception:
+            pass
+
+
 def valid_chat_url(url: str) -> bool:
     try:
         u = urlparse((url or "").strip())
@@ -211,7 +247,37 @@ def _launch(pw, headless: bool):
               timezone_id="America/Bogota", args=["--no-first-run", "--no-default-browser-check", "--disable-dev-shm-usage"])
     if CHROMIUM_PATH:
         kw["executable_path"] = CHROMIUM_PATH
-    return pw.chromium.launch_persistent_context(str(PROFILE_DIR), **kw)
+    _say("Iniciando navegador " + ("(sin ventana)" if headless else "(con ventana)") + "…")
+    ctx = pw.chromium.launch_persistent_context(str(PROFILE_DIR), **kw)
+    restore_cookies(ctx)
+    return ctx
+
+
+# Microsoft guarda parte de la sesion en cookies «de sesion» (sin fecha de caducidad), que Chromium
+# descarta al cerrarse aunque el perfil sea persistente. Se guardan aparte y se restauran al abrir.
+COOKIES_FILE = PROFILE_DIR.parent / "teams_cookies.json"
+
+
+def save_cookies(ctx):
+    """Llamar SOLO cuando la sesion esta activa (nunca tras ver el login)."""
+    try:
+        data = ctx.cookies()
+        COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = COOKIES_FILE.with_suffix(".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, COOKIES_FILE)
+    except Exception as e:  # noqa
+        log.warning("No se pudieron guardar las cookies de Teams: %s", e.__class__.__name__)
+
+
+def restore_cookies(ctx):
+    try:
+        if COOKIES_FILE.exists():
+            ctx.add_cookies(json.loads(COOKIES_FILE.read_text(encoding="utf-8")))
+    except Exception as e:  # noqa
+        log.warning("No se pudieron restaurar las cookies de Teams: %s", e.__class__.__name__)
 
 
 def _first(page, key, timeout_ms=0, visible=True):
@@ -283,21 +349,23 @@ def _norm(s: str) -> str:
 
 def open_target(page, chat_url: str, chat_name: str) -> tuple:
     """(ok, code, mensaje). Abre el destino y comprueba que es el chat esperado."""
+    _say("Abriendo " + ((urlparse(chat_url).hostname or "Teams") if chat_url else "Teams") + "…")
     if chat_url:
         page.goto(chat_url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
         state = _wait_ready(page, NAV_TIMEOUT_MS)
         if state == "login":
-            return False, SESSION_EXPIRED, "Teams pide iniciar sesión de nuevo."
+            return False, SESSION_EXPIRED, _login_msg(page)
         if state == "timeout":
             return False, NETWORK, "Teams no terminó de cargar."
     else:
-        page.goto(TEAMS_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        page.goto(home_url(chat_url), wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
         state = _wait_ready(page, NAV_TIMEOUT_MS)
         if state == "login":
-            return False, SESSION_EXPIRED, "Teams pide iniciar sesión de nuevo."
+            return False, SESSION_EXPIRED, _login_msg(page)
         if state == "timeout":
             return False, NETWORK, "Teams no terminó de cargar."
 
+    _say("Teams cargó. Comprobando que el chat abierto es el correcto…")
     if chat_name and not _chat_matches(page, chat_name):
         # Buscar el chat por nombre en la lista lateral
         found = False
@@ -320,6 +388,7 @@ def open_target(page, chat_url: str, chat_name: str) -> tuple:
     if not _first(page, "composer", timeout_ms=15000):
         return False, COMPOSER_NOT_FOUND, ("No se encontró el cuadro para escribir mensajes (¿la cuenta no tiene permiso "
                                            "para escribir en este chat/canal, o cambió la interfaz de Teams?).")
+    _say("Chat listo y cuadro de mensaje encontrado.")
     return True, OK, ""
 
 
@@ -327,6 +396,7 @@ def open_target(page, chat_url: str, chat_name: str) -> tuple:
 # Escritura y verificacion
 # ------------------------------------------------------------------
 def _type_message(page, lines):
+    _say(f"Escribiendo el reporte ({len(lines)} líneas)…")
     comp = _first(page, "composer", timeout_ms=5000)
     comp.click()
     page.keyboard.press("Control+A")
@@ -349,6 +419,7 @@ def _composer_text(page) -> str:
 
 
 def _submit(page):
+    _say("Pulsando Enviar…")
     btn = _first(page, "send", timeout_ms=3000)
     if btn:
         btn.click()
@@ -372,6 +443,20 @@ def _message_state(page, marker: str) -> str:
                 return "delivered"
         except Exception:
             continue
+    # Respaldo independiente de la interfaz: la referencia unica visible como texto FUERA del cuadro de
+    # escritura (que ya se vacio al enviar). Sirve aunque Teams cambie los nombres internos de sus elementos.
+    try:
+        hits = page.get_by_text(marker)
+        n = hits.count()
+        for i in range(min(n, 5)):
+            el = hits.nth(i)
+            in_editor = el.locator('xpath=ancestor-or-self::*[@contenteditable="true" or @role="textbox"]').count() > 0
+            if not in_editor and el.is_visible():
+                if page.locator('[data-tid*="send-failed"], [aria-label*="Failed" i], [aria-label*="No se pudo" i]').count() > 0:
+                    return "failed"
+                return "delivered"
+    except Exception:
+        pass
     return "absent"
 
 
@@ -391,9 +476,63 @@ def _proof(page, marker: str) -> str:
         PROOF_DIR.mkdir(parents=True, exist_ok=True)
         p = PROOF_DIR / f"{marker}.png"
         page.screenshot(path=str(p))
+        if marker.startswith("fail-"):  # para diagnosticar cambios de interfaz
+            (PROOF_DIR / f"{marker}.html").write_text(page.content()[:400000], encoding="utf-8")
         return str(p)
     except Exception:
         return ""
+
+
+# Peticion con la que Teams entrega un mensaje al servicio de chat: POST .../conversations/<id>/messages.
+# Un mensaje que solo se ve en pantalla pero cuyo POST no recibio 2xx queda «pendiente» (circulo hueco) y
+# NO esta entregado. Es la confirmacion real, independiente de la interfaz.
+_MSG_POST = re.compile(r"/conversations/[^/]+/messages(?:[/?]|$)", re.I)
+
+
+def _watch_network(page) -> dict:
+    net = {"ok": [], "bad": [], "posts": [], "failed": 0, "errors": [], "ws": []}
+    noise = ("browser.events.data.microsoft.com", "OneCollector", "events.data", "clarity.ms")
+
+    def short(url):
+        u = urlparse(url)
+        return f"{u.hostname}{u.path[:60]}"
+
+    def on_response(r):
+        try:
+            if r.status >= 400 and not any(n in r.url for n in noise):
+                net["errors"].append(f"{r.request.method} {short(r.url)} → HTTP {r.status}")
+            if r.request.method != "POST":
+                return
+            u = urlparse(r.url)
+            net["posts"].append(f"{u.hostname}{u.path[:70]} → {r.status}")
+            if _MSG_POST.search(r.url):
+                (net["ok"] if 200 <= r.status < 300 else net["bad"]).append(r.status)
+                _say(f"Teams respondió HTTP {r.status} al envío del mensaje")
+        except Exception:
+            pass
+
+    def on_failed(req):
+        try:
+            if not any(n in req.url for n in noise):
+                net["errors"].append(f"{req.method} {short(req.url)} → falló: {req.failure}")
+            if req.method == "POST" and _MSG_POST.search(req.url):
+                net["failed"] += 1
+                _say(f"Falló la petición de envío: {req.failure}")
+        except Exception:
+            pass
+
+    def on_ws(ws):
+        try:
+            net["ws"].append(f"abierto {short(ws.url)}")
+            ws.on("close", lambda *_: net["ws"].append(f"cerrado {short(ws.url)}"))
+            ws.on("socketerror", lambda e: net["ws"].append(f"error {short(ws.url)}: {str(e)[:60]}"))
+        except Exception:
+            pass
+
+    page.on("websocket", on_ws)
+    page.on("response", on_response)
+    page.on("requestfailed", on_failed)
+    return net
 
 
 def _send_once(pw, chat_url, chat_name, lines, marker, headless) -> dict:
@@ -409,14 +548,34 @@ def _send_once(pw, chat_url, chat_name, lines, marker, headless) -> dict:
         if marker not in _composer_text(page):
             return {"ok": False, "verified": False, "code": ERROR, "error": "El texto no quedó escrito en el cuadro de mensaje.",
                     "proof": _proof(page, "fail-" + marker)}
+        net = _watch_network(page)
         _submit(page)
+        _say(f"Esperando la confirmación de Teams (máx. {int(VERIFY_TIMEOUT_S)} s)…")
+        end = time.time() + VERIFY_TIMEOUT_S
+        while time.time() < end and not net["ok"] and not net["bad"] and not net["failed"]:
+            page.wait_for_timeout(500)  # (no time.sleep: Playwright solo procesa eventos de red dentro de sus llamadas)
+        if net["bad"] or net["failed"] or not net["ok"]:
+            if net["bad"]:
+                why = f"Teams rechazó el envío (HTTP {net['bad'][-1]}). Revisa que la cuenta pueda escribir en este chat/reunión."
+            elif net["failed"]:
+                why = "No hubo conexión con el servicio de mensajes de Teams al enviar."
+            else:
+                why = ("El mensaje se escribió pero Teams no confirmó el envío: queda pendiente (círculo hueco) en el navegador. "
+                       "No se da por entregado.")
+            _say("Peticiones POST observadas: " + ("; ".join(net["posts"][-6:]) or "ninguna"))
+            _say("Errores de red durante la carga/envío: " + ("; ".join(list(dict.fromkeys(net["errors"]))[:8]) or "ninguno"))
+            _say("WebSockets (conexión en tiempo real de Teams): " + ("; ".join(net["ws"][:6]) or "NINGUNO abierto"))
+            return {"ok": False, "verified": False, "code": NOT_DELIVERED, "error": why, "proof": _proof(page, "fail-" + marker)}
+        _say("Teams confirmó la recepción (HTTP 2xx). Comprobando que se ve en el chat…")
         state = _wait_delivered(page, marker, VERIFY_TIMEOUT_S)
         if state == "delivered":
             # Segunda comprobacion: recargar y confirmar que el mensaje esta en el servidor, no solo en pantalla.
+            _say("Apareció. Recargando la página para confirmar que quedó guardado en Teams…")
             page.reload(wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
             if _wait_ready(page, NAV_TIMEOUT_MS) == "ready":
                 state = _wait_delivered(page, marker, VERIFY_TIMEOUT_S)
         if state == "delivered":
+            save_cookies(ctx)
             return {"ok": True, "verified": True, "code": OK, "error": "", "marker": marker, "proof": _proof(page, marker),
                     "chat": _title_text(page)[:120]}
         why = ("Teams mostró el mensaje como no enviado." if state == "failed"
@@ -427,12 +586,13 @@ def _send_once(pw, chat_url, chat_name, lines, marker, headless) -> dict:
             ctx.close()
 
 
-def send_message(chat_url: str, chat_name: str, lines, marker: str = None, headless: bool = None) -> dict:
+def send_message(chat_url: str, chat_name: str, lines, marker: str = None, headless: bool = None, progress=None) -> dict:
     """
     Envia `lines` al chat/canal y VERIFICA que llegó.
     Devuelve {'ok','verified','code','error','marker','proof','attempts'}. Nunca lanza.
     """
     marker = marker or new_marker()
+    _tl.cb, _tl.t0 = progress, time.time()
     headless = HEADLESS if headless is None else headless
     base = {"ok": False, "verified": False, "marker": marker, "proof": "", "attempts": 0}
     if not (chat_url or chat_name):
@@ -453,6 +613,7 @@ def send_message(chat_url: str, chat_name: str, lines, marker: str = None, headl
             return {**base, "code": BUSY, "error": "Otro proceso está usando la sesión de Teams; se reintentará en el próximo envío."}
         last = {**base, "code": ERROR, "error": "sin intentos"}
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            _say(f"Intento {attempt} de {MAX_ATTEMPTS}")
             try:
                 with sync_playwright() as pw:
                     res = _send_once(pw, chat_url, chat_name, body, marker, headless)
@@ -470,12 +631,14 @@ def send_message(chat_url: str, chat_name: str, lines, marker: str = None, headl
             except Exception as e:  # noqa
                 res = {**base, "code": ERROR, "error": f"{e.__class__.__name__}: {str(e)[:120]}"}
             res["attempts"] = attempt
+            _say(("✔ Entregado y verificado." if res["ok"] else f"✖ {res.get('error')} [{res.get('code')}]"))
             res.setdefault("marker", marker)
             last = res
             if res["ok"]:
                 break
             # Sesion caducada, destino equivocado o sin permiso: reintentar no sirve
-            if res["code"] in (SESSION_EXPIRED, TARGET_NOT_FOUND, WRONG_CHAT, COMPOSER_NOT_FOUND, NO_BROWSER):
+            # NOT_DELIVERED tampoco se reintenta: un mensaje pendiente se reenvia solo mas tarde y duplicaria el reporte
+            if res["code"] in (SESSION_EXPIRED, TARGET_NOT_FOUND, WRONG_CHAT, COMPOSER_NOT_FOUND, NO_BROWSER, NOT_DELIVERED):
                 break
             time.sleep(min(5 * attempt, 15))
     log.info("Teams: destino=%s ok=%s verificado=%s código=%s intentos=%s ref=%s",
@@ -486,7 +649,7 @@ def send_message(chat_url: str, chat_name: str, lines, marker: str = None, headl
 # ------------------------------------------------------------------
 # Estado de la sesion (para la interfaz y el aviso de caducidad)
 # ------------------------------------------------------------------
-def session_status(headless: bool = True) -> dict:
+def session_status(chat_url: str = "", headless: bool = True) -> dict:
     """{'state': 'ok'|'expired'|'none'|'busy'|'error', 'message'}  (no escribe nada en Teams)."""
     ready, why = playwright_ready()
     if not ready:
@@ -502,8 +665,11 @@ def session_status(headless: bool = True) -> dict:
                 ctx = _launch(pw, headless)
                 try:
                     page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                    page.goto(TEAMS_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                    page.goto(chat_url if chat_url and valid_chat_url(chat_url) else home_url(chat_url),
+                              wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
                     st = _wait_ready(page, NAV_TIMEOUT_MS)
+                    if st == "ready":
+                        save_cookies(ctx)
                 finally:
                     with contextlib.suppress(Exception):
                         ctx.close()

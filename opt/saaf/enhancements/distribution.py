@@ -115,14 +115,14 @@ def _teams_result(res: dict, rc: dict) -> dict:
             "marker": res.get("marker"), "proof": res.get("proof", ""), "attempts": res.get("attempts", 0)}
 
 
-def test_teams(site_id: int) -> dict:
+def test_teams(site_id: int, progress=None) -> dict:
     """Envia un mensaje de prueba REAL al chat y verifica que aparece. Devuelve el resultado completo."""
     rc = cfgmod.get_site_config(site_id)["report"]
     marker = teams_browser.new_marker("SAAF-PRUEBA")
     res = teams_browser.send_message(
         rc["teams_chat_url"], rc["teams_chat_name"],
         ["✅ SAAF Pro — prueba de conexión con Teams",
-         "Si ves este mensaje, los reportes de esta campaña llegarán a este chat."], marker=marker)
+         "Si ves este mensaje, los reportes de esta campaña llegarán a este chat."], marker=marker, progress=progress)
     _notify_session_problem(site_id, res)
     return _teams_result(res, rc)
 

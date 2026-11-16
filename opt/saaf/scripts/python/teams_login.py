@@ -3,6 +3,8 @@
 # SAAF Pro — scripts/python/teams_login.py
 # Prepara y comprueba el envio de reportes a Microsoft Teams SIN webhook.
 #
+#   teams_login.py --chat-url URL     (RECOMENDADO) igual, pero entra por el enlace del chat: asi la sesion queda
+#                                     en el dominio correcto (teams.live.com = cuenta personal; teams.microsoft.com = trabajo).
 #   teams_login.py                    Abre Chromium con ventana: inicia sesion TU (usuario, contrasena y MFA).
 #                                     La sesion queda guardada en el perfil de SAAF. Se hace una sola vez
 #                                     (y de nuevo solo si Microsoft cierra la sesion).
@@ -46,7 +48,7 @@ def cmd_login(args) -> int:
             ctx = tb._launch(pw, headless=False)
             try:
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                page.goto(tb.TEAMS_URL, wait_until="domcontentloaded", timeout=tb.NAV_TIMEOUT_MS)
+                page.goto(args.chat_url or tb.TEAMS_URL, wait_until="domcontentloaded", timeout=tb.NAV_TIMEOUT_MS)
                 deadline = time.time() + 600
                 seen_ready = 0
                 while time.time() < deadline:
@@ -64,6 +66,7 @@ def cmd_login(args) -> int:
                     print("✖ No se detectó una sesión de Teams iniciada a tiempo.")
                     return 1
                 time.sleep(3)  # deja que Chromium escriba las cookies al disco
+                tb.save_cookies(ctx)  # incluye las cookies de sesion, que Chromium no conserva al cerrar
             finally:
                 ctx.close()
     print("✔ Sesión de Teams guardada. Ahora prueba:  teams_login.py --check   y   --send-test")
@@ -71,7 +74,7 @@ def cmd_login(args) -> int:
 
 
 def cmd_check(args) -> int:
-    st = tb.session_status(headless=True)
+    st = tb.session_status(args.chat_url, headless=True)
     print(json.dumps(st, ensure_ascii=False))
     return 0 if st["state"] == "ok" else 1
 
@@ -80,7 +83,7 @@ def cmd_send_test(args) -> int:
     marker = tb.new_marker("SAAF-PRUEBA")
     res = tb.send_message(args.chat_url or "", args.chat_name or "",
                           ["✅ SAAF Pro — prueba de envío a Teams", "Mensaje de prueba generado por teams_login.py"],
-                          marker=marker, headless=not args.show)
+                          marker=marker, headless=not args.show, progress=print)
     print(json.dumps(res, ensure_ascii=False, indent=2))
     if res["ok"] and res["verified"]:
         print(f"\n✔ Mensaje recibido y verificado en Teams. Referencia: {marker}. Evidencia: {res['proof']}")

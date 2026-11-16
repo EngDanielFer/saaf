@@ -66,3 +66,4 @@ Desktop.ini
 # Sesion de Teams (cookies de la cuenta): NUNCA versionar
 opt/saaf/data/teams_profile/
 opt/saaf/logs/teams_proof/
+opt/saaf/data/teams_cookies.json
