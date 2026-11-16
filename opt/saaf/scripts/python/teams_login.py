@@ -11,6 +11,8 @@
 #   teams_login.py --check            Comprueba (sin escribir nada) que la sesion sigue activa.
 #   teams_login.py --send-test --chat-url URL [--chat-name NOMBRE]
 #                                     Envia un mensaje REAL al chat y verifica que aparece. Guarda captura.
+#   Cuentas distintas (personal / trabajo): añade  --profile personal  (o trabajo) a CUALQUIERA de los comandos
+#   y escribe el mismo nombre en el dashboard (Campañas → Reportes → Cuenta de Teams).
 #   teams_login.py --diagnose [--chat-url URL]
 #                                     Si Teams cambio su interfaz: muestra que selectores encuentra y guarda
 #                                     una captura, para ajustar SAAF_TEAMS_SELECTORS.
@@ -37,7 +39,7 @@ def cmd_login(args) -> int:
         print("✖", why)
         return 2
     sync_playwright, _, _ = tb._import_playwright()
-    print(f"Perfil de sesión: {tb.PROFILE_DIR}")
+    print(f"Perfil de sesión: {tb.profile_dir()}")
     print("Se abrirá Chromium. Inicia sesión en Microsoft Teams con la cuenta que publicará los reportes")
     print("(incluye el MFA que te pida Microsoft) y espera a ver tus chats. Tienes 10 minutos.")
     with tb.profile_lock(wait_s=10) as got:
@@ -83,7 +85,7 @@ def cmd_send_test(args) -> int:
     marker = tb.new_marker("SAAF-PRUEBA")
     res = tb.send_message(args.chat_url or "", args.chat_name or "",
                           ["✅ SAAF Pro — prueba de envío a Teams", "Mensaje de prueba generado por teams_login.py"],
-                          marker=marker, headless=not args.show, progress=print)
+                          marker=marker, headless=not args.show, progress=print, profile=args.profile)
     print(json.dumps(res, ensure_ascii=False, indent=2))
     if res["ok"] and res["verified"]:
         print(f"\n✔ Mensaje recibido y verificado en Teams. Referencia: {marker}. Evidencia: {res['proof']}")
@@ -128,10 +130,12 @@ def main() -> int:
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--send-test", action="store_true")
     ap.add_argument("--diagnose", action="store_true")
+    ap.add_argument("--profile", default="", help="nombre de la cuenta/perfil (p. ej. personal, trabajo); vacío = por defecto")
     ap.add_argument("--chat-url", default="")
     ap.add_argument("--chat-name", default="")
     ap.add_argument("--show", action="store_true", help="mostrar la ventana del navegador en --send-test/--diagnose")
     args = ap.parse_args()
+    tb.set_profile(args.profile)
     if args.check:
         return cmd_check(args)
     if args.send_test:

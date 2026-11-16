@@ -67,3 +67,5 @@ Desktop.ini
 opt/saaf/data/teams_profile/
 opt/saaf/logs/teams_proof/
 opt/saaf/data/teams_cookies.json
+opt/saaf/data/teams_profile_*/
+opt/saaf/data/teams_cookies_*.json

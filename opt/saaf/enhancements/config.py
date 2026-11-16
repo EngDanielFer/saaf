@@ -59,6 +59,10 @@ GLOBAL_DEFAULTS = {
     # Reflejar el criterio de la auditoria IA en la pantalla ALERTAS original:
     #   off | legit | legit_fp   (ver enhancements/alerts_sync.py). Reversible.
     "mute_alerts": "off",
+    # Chat de Teams COMUN para todas las campanias que marquen «usar el chat común»
+    "teams_chat_url": "",
+    "teams_chat_name": "",
+    "teams_profile": "",
 }
 
 SITE_DEFAULTS = {
@@ -73,6 +77,8 @@ SITE_DEFAULTS = {
         "teams_enabled": False,
         "teams_chat_url": "",         # enlace del chat/canal (Teams: «Copiar vínculo»); sin webhook
         "teams_chat_name": "",        # nombre esperado del chat: si no coincide, NO se envía
+        "teams_use_global": False,    # True = usa el chat/cuenta comunes de General (ignora los de la campaña)
+        "teams_profile": "",          # cuenta/perfil de Teams ('' = por defecto; p. ej. 'personal' o 'trabajo')
         "emails": [],
         "email_enabled": False,
         "mode": "after_each_audit",   # after_each_audit | scheduled
@@ -118,6 +124,12 @@ def _deep_merge(base: dict, over: dict) -> dict:
 # ------------------------------------------------------------------
 # GLOBAL
 # ------------------------------------------------------------------
+def _norm_teams_global(c: dict):
+    c["teams_chat_url"] = (c.get("teams_chat_url") or "").strip()[:1500]
+    c["teams_chat_name"] = re.sub(r"\s+", " ", (c.get("teams_chat_name") or "")).strip()[:120]
+    c["teams_profile"] = re.sub(r"[^a-z0-9_-]", "", (c.get("teams_profile") or "").lower())[:30]
+
+
 def get_global() -> dict:
     cfg = dict(GLOBAL_DEFAULTS)
     try:
@@ -131,6 +143,7 @@ def get_global() -> dict:
     cfg["min_auth_confidence"] = _clamp_int(cfg.get("min_auth_confidence"), 0, 100, 50)
     if cfg.get("mute_alerts") not in MUTE_MODES:
         cfg["mute_alerts"] = "off"
+    _norm_teams_global(cfg)
     # compatibilidad con el ajuste anterior (booleano)
     if cfg["mute_alerts"] == "off" and cfg.get("apply_legit_to_alerts"):
         cfg["mute_alerts"] = "legit"
@@ -147,6 +160,7 @@ def set_global(**fields) -> dict:
     cur["min_auth_confidence"] = _clamp_int(cur["min_auth_confidence"], 0, 100, 50)
     if cur.get("mute_alerts") not in MUTE_MODES:
         cur["mute_alerts"] = "off"
+    _norm_teams_global(cur)
     cur["apply_legit_to_alerts"] = cur["mute_alerts"] != "off"  # se mantiene por compatibilidad
     set_setting("enh_global", json.dumps(cur))
     return cur
@@ -209,7 +223,9 @@ def normalize_site_config(cfg: dict) -> dict:
     s["minute"] = _clamp_int(s.get("minute"), 0, 59, 0)
 
     r["teams_enabled"] = bool(r.get("teams_enabled"))
+    r["teams_use_global"] = bool(r.get("teams_use_global"))
     r["teams_chat_url"] = (r.get("teams_chat_url") or "").strip()[:1500]
+    r["teams_profile"] = re.sub(r"[^a-z0-9_-]", "", (r.get("teams_profile") or "").lower())[:30]
     r["teams_chat_name"] = re.sub(r"\s+", " ", (r.get("teams_chat_name") or "")).strip()[:120]
     r["email_enabled"] = bool(r.get("email_enabled"))
     r["emails"] = parse_emails(r.get("emails"))
@@ -298,3 +314,51 @@ def has_wp_password(site_id) -> bool:
 
 def clear_wp_password(site_id):
     delete_secret(_wp_key(site_id))
+
+
+# ------------------------------------------------------------------
+# Teams: chat/cuenta efectivos y credenciales
+# ------------------------------------------------------------------
+def effective_teams(site_id: int) -> dict:
+    """Destino de Teams que usa la campania: el comun (General) si lo marco y esta definido; si no, el propio."""
+    rc = get_site_config(site_id)["report"]
+    g = get_global()
+    if rc["teams_use_global"] and (g["teams_chat_url"] or g["teams_chat_name"]):
+        return {"chat_url": g["teams_chat_url"], "chat_name": g["teams_chat_name"], "profile": g["teams_profile"], "source": "global"}
+    return {"chat_url": rc["teams_chat_url"], "chat_name": rc["teams_chat_name"], "profile": rc["teams_profile"], "source": "campaña"}
+
+
+def _tcred_key(profile: str) -> str:
+    return "teams_login:" + (re.sub(r"[^a-z0-9_-]", "", (profile or "").lower())[:30] or "default")
+
+
+def set_teams_credentials(profile: str, user: str, password: str):
+    """Usuario y contrasena de la cuenta de Teams de ese perfil (cifrados si hay SAAF_SECRET_KEY)."""
+    set_secret(_tcred_key(profile), json.dumps({"user": (user or "").strip(), "password": password or ""}))
+
+
+def get_teams_credentials(profile: str):
+    raw = get_secret(_tcred_key(profile))
+    try:
+        d = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    return d if d and d.get("user") and d.get("password") else None
+
+
+def teams_credentials_user(profile: str):
+    d = get_teams_credentials(profile)
+    return d["user"] if d else None
+
+
+def clear_teams_credentials(profile: str):
+    delete_secret(_tcred_key(profile))
+
+
+def use_global_teams_everywhere(site_ids) -> int:
+    """Marca todas las campanias para usar el chat comun (y activa el envio a Teams). Devuelve cuantas cambio."""
+    n = 0
+    for sid in site_ids:
+        set_site_config(sid, {"report": {"teams_enabled": True, "teams_use_global": True}})
+        n += 1
+    return n

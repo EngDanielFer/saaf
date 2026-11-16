@@ -61,7 +61,7 @@ def _login_msg(page) -> str:
         host = urlparse(page.url).hostname or "?"
     except Exception:
         host = "?"
-    return f"Teams pide iniciar sesión de nuevo (página: {host}). Ejecuta teams_login.py con --chat-url del mismo enlace."
+    return f"Teams pide iniciar sesión de nuevo (página: {host}). Ejecuta: " + login_hint()
 
 TEAMS_HOSTS = ("teams.microsoft.com", "teams.cloud.microsoft", "teams.live.com")
 LOGIN_HOSTS = ("login.microsoftonline.com", "login.live.com", "login.microsoft.com", "account.live.com",
@@ -79,6 +79,8 @@ COMPOSER_NOT_FOUND = "COMPOSER_NOT_FOUND"
 NOT_DELIVERED = "NOT_DELIVERED"
 NETWORK = "NETWORK"
 BUSY = "BUSY"
+MFA_REQUIRED = "MFA_REQUIRED"
+BAD_CREDENTIALS = "BAD_CREDENTIALS"
 ERROR = "ERROR"
 
 # Selectores de la interfaz de Teams Web (la UI cambia con el tiempo). Se pueden
@@ -124,6 +126,35 @@ _load_selector_overrides()
 # Validacion de destino y texto
 # ------------------------------------------------------------------
 _tl = threading.local()
+
+
+def clean_profile(name: str) -> str:
+    return re.sub(r"[^a-z0-9_-]", "", (name or "").lower())[:30]
+
+
+def set_profile(name: str):
+    """Cuenta/perfil de Teams a usar en este hilo. '' = perfil por defecto (el de siempre)."""
+    _tl.profile = clean_profile(name)
+
+
+def profile_name() -> str:
+    return getattr(_tl, "profile", "") or ""
+
+
+def profile_dir() -> Path:
+    """Cada cuenta (p. ej. personal y de trabajo) usa su propio perfil: las sesiones de Microsoft se pisarian."""
+    n = profile_name()
+    return PROFILE_DIR if not n else PROFILE_DIR.parent / f"teams_profile_{n}"
+
+
+def cookies_file() -> Path:
+    n = profile_name()
+    return PROFILE_DIR.parent / ("teams_cookies.json" if not n else f"teams_cookies_{n}.json")
+
+
+def login_hint() -> str:
+    n = profile_name()
+    return "venv/bin/python opt/saaf/scripts/python/teams_login.py" + (f" --profile {n}" if n else "") + " --chat-url \"<enlace>\""
 
 
 def _say(msg: str):
@@ -189,12 +220,13 @@ def profile_lock(wait_s: float = None):
     """Un solo proceso a la vez usa el perfil (scheduler y dashboard comparten el mismo)."""
     import fcntl
 
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    pd = profile_dir()
+    pd.mkdir(parents=True, exist_ok=True)
     try:
-        PROFILE_DIR.chmod(0o700)
+        pd.chmod(0o700)
     except OSError:
         pass
-    fh = open(PROFILE_DIR.parent / ".saaf_teams.lock", "w")
+    fh = open(PROFILE_DIR.parent / (".saaf_teams.lock" if not profile_name() else f".saaf_teams_{profile_name()}.lock"), "w")
     deadline = time.time() + (LOCK_WAIT_S if wait_s is None else wait_s)
     got = False
     try:
@@ -218,7 +250,7 @@ def profile_lock(wait_s: float = None):
 def _clear_stale_chromium_locks():
     """Tras un reinicio o caida, Chromium deja SingletonLock; como ya tenemos el bloqueo propio, es huerfano."""
     for n in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-        p = PROFILE_DIR / n
+        p = profile_dir() / n
         with contextlib.suppress(OSError):
             if p.is_symlink() or p.exists():
                 p.unlink()
@@ -241,41 +273,42 @@ def playwright_ready() -> tuple:
 
 
 def _launch(pw, headless: bool):
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    profile_dir().mkdir(parents=True, exist_ok=True)
     _clear_stale_chromium_locks()
     kw = dict(headless=headless, viewport={"width": 1440, "height": 900}, locale="es-CO",
               timezone_id="America/Bogota", args=["--no-first-run", "--no-default-browser-check", "--disable-dev-shm-usage"])
     if CHROMIUM_PATH:
         kw["executable_path"] = CHROMIUM_PATH
     _say("Iniciando navegador " + ("(sin ventana)" if headless else "(con ventana)") + "…")
-    ctx = pw.chromium.launch_persistent_context(str(PROFILE_DIR), **kw)
+    ctx = pw.chromium.launch_persistent_context(str(profile_dir()), **kw)
     restore_cookies(ctx)
     return ctx
 
 
 # Microsoft guarda parte de la sesion en cookies «de sesion» (sin fecha de caducidad), que Chromium
 # descarta al cerrarse aunque el perfil sea persistente. Se guardan aparte y se restauran al abrir.
-COOKIES_FILE = PROFILE_DIR.parent / "teams_cookies.json"
 
 
 def save_cookies(ctx):
     """Llamar SOLO cuando la sesion esta activa (nunca tras ver el login)."""
     try:
         data = ctx.cookies()
-        COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = COOKIES_FILE.with_suffix(".tmp")
+        cf = cookies_file()
+        cf.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cf.with_suffix(".tmp")
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
-        os.replace(tmp, COOKIES_FILE)
+        os.replace(tmp, cf)
     except Exception as e:  # noqa
         log.warning("No se pudieron guardar las cookies de Teams: %s", e.__class__.__name__)
 
 
 def restore_cookies(ctx):
     try:
-        if COOKIES_FILE.exists():
-            ctx.add_cookies(json.loads(COOKIES_FILE.read_text(encoding="utf-8")))
+        cf = cookies_file()
+        if cf.exists():
+            ctx.add_cookies(json.loads(cf.read_text(encoding="utf-8")))
     except Exception as e:  # noqa
         log.warning("No se pudieron restaurar las cookies de Teams: %s", e.__class__.__name__)
 
@@ -323,6 +356,74 @@ def _wait_ready(page, timeout_ms):
             return "ready"
         time.sleep(0.7)
     return "login" if is_login_page(page) else "timeout"
+
+
+# ------------------------------------------------------------------
+# Re-inicio de sesion con las credenciales guardadas (solo si la sesion caduco)
+# ------------------------------------------------------------------
+_MFA_TEXT = re.compile(r"(verify your identity|verifica tu identidad|approve sign.?in|aprobar la solicitud|aprueba la solicitud|"
+                       r"enter code|escribe el c[oó]digo|introduce el c[oó]digo|authenticator|autenticador|"
+                       r"more information required|se necesita m[aá]s informaci[oó]n|prove you.re not a robot|captcha)", re.I)
+_KMSI_TEXT = re.compile(r"(stay signed in|mantener la sesi[oó]n iniciada|keep me signed in)", re.I)
+
+
+def _click_primary(page):
+    for sel in ("#idSIButton9", 'input[type="submit"]', 'button[type="submit"]'):
+        try:
+            b = page.locator(sel)
+            if b.count() > 0 and b.first.is_visible():
+                b.first.click(timeout=3000)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _auto_login(page, creds: dict, timeout_s: float = 90.0) -> tuple:
+    """
+    Escribe usuario y contrasena en la pantalla de Microsoft. NO elude MFA, captcha ni ningun control: si
+    Microsoft pide una verificacion adicional se detiene con MFA_REQUIRED. (ok, codigo, mensaje)
+    """
+    _say("La sesión caducó: intentando iniciar sesión con las credenciales guardadas…")
+    end = time.time() + timeout_s
+    did_user = did_pw = False
+    pw_at = 0.0
+    kmsi_clicks = 0
+    while time.time() < end:
+        if not is_login_page(page) and (_first(page, "ready") or _first(page, "composer")):
+            _say("Sesión iniciada con las credenciales guardadas.")
+            return True, OK, ""
+        try:
+            body = page.inner_text("body", timeout=2000)[:4000]
+        except Exception:
+            body = ""
+        try:
+            u = page.locator('input[name="loginfmt"]:visible')
+            pw = page.locator('input[name="passwd"]:visible')
+            err = page.locator("#usernameError:visible, #passwordError:visible, #i0118Error:visible, #idTD_Error:visible")
+            if err.count() > 0:
+                return False, BAD_CREDENTIALS, "Microsoft rechazó el usuario o la contraseña guardados. Actualízalos en General → Teams."
+            if u.count() > 0 and not did_user:
+                u.first.fill(creds["user"])
+                _click_primary(page)
+                did_user = True
+            elif pw.count() > 0 and not did_pw:
+                pw.first.fill(creds["password"])
+                _click_primary(page)
+                did_pw, pw_at = True, time.time()
+            elif pw.count() > 0 and did_pw and time.time() - pw_at > 6:
+                return False, BAD_CREDENTIALS, "La contraseña guardada no fue aceptada. Actualízala en General → Teams."
+            elif _KMSI_TEXT.search(body) and kmsi_clicks < 3:
+                _click_primary(page)  # «Sí» a mantener la sesion iniciada
+                kmsi_clicks += 1
+            elif _MFA_TEXT.search(body) or page.locator("#idTxtBx_SAOTCC_OTC, #idDiv_SAOTCAS_Title, #displaySign").count() > 0:
+                return False, MFA_REQUIRED, ("Microsoft pide una verificación adicional (MFA/captcha) que no se puede automatizar. "
+                                             "Inicia sesión a mano con teams_login.py; la sesión durará hasta que Microsoft la cierre.")
+        except Exception:
+            pass
+        page.wait_for_timeout(900)
+    return False, SESSION_EXPIRED, ("No se reconoció la pantalla de inicio de sesión (¿SSO corporativo?). "
+                                    "Inicia sesión a mano con teams_login.py.")
 
 
 # ------------------------------------------------------------------
@@ -535,13 +636,20 @@ def _watch_network(page) -> dict:
     return net
 
 
-def _send_once(pw, chat_url, chat_name, lines, marker, headless) -> dict:
+def _send_once(pw, chat_url, chat_name, lines, marker, headless, creds=None) -> dict:
     ctx = _launch(pw, headless)
     page = None
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.set_default_timeout(20000)
         ok, code, msg = open_target(page, chat_url, chat_name)
+        if not ok and code == SESSION_EXPIRED and creds:
+            ok2, code2, msg2 = _auto_login(page, creds)
+            if ok2:
+                save_cookies(ctx)
+                ok, code, msg = open_target(page, chat_url, chat_name)
+            else:
+                ok, code, msg = False, code2, msg2
         if not ok:
             return {"ok": False, "verified": False, "code": code, "error": msg, "proof": _proof(page, "fail-" + marker)}
         _type_message(page, lines)
@@ -586,13 +694,15 @@ def _send_once(pw, chat_url, chat_name, lines, marker, headless) -> dict:
             ctx.close()
 
 
-def send_message(chat_url: str, chat_name: str, lines, marker: str = None, headless: bool = None, progress=None) -> dict:
+def send_message(chat_url: str, chat_name: str, lines, marker: str = None, headless: bool = None, progress=None,
+                profile: str = "", creds: dict = None) -> dict:
     """
     Envia `lines` al chat/canal y VERIFICA que llegó.
     Devuelve {'ok','verified','code','error','marker','proof','attempts'}. Nunca lanza.
     """
     marker = marker or new_marker()
     _tl.cb, _tl.t0 = progress, time.time()
+    set_profile(profile)
     headless = HEADLESS if headless is None else headless
     base = {"ok": False, "verified": False, "marker": marker, "proof": "", "attempts": 0}
     if not (chat_url or chat_name):
@@ -602,9 +712,9 @@ def send_message(chat_url: str, chat_name: str, lines, marker: str = None, headl
     ready, why = playwright_ready()
     if not ready:
         return {**base, "code": NO_PLAYWRIGHT, "error": why}
-    if not (PROFILE_DIR.exists() and any(PROFILE_DIR.iterdir())):
+    if not (profile_dir().exists() and any(profile_dir().iterdir())):
         return {**base, "code": SESSION_EXPIRED,
-                "error": "No hay sesión de Teams guardada. Ejecuta una vez: venv/bin/python scripts/python/teams_login.py"}
+                "error": "No hay sesión de Teams guardada para esta cuenta. Ejecuta una vez: " + login_hint()}
     sync_playwright, PWTimeout, PWError = _import_playwright()
     body = prepare_lines(lines, marker)
 
@@ -616,7 +726,7 @@ def send_message(chat_url: str, chat_name: str, lines, marker: str = None, headl
             _say(f"Intento {attempt} de {MAX_ATTEMPTS}")
             try:
                 with sync_playwright() as pw:
-                    res = _send_once(pw, chat_url, chat_name, body, marker, headless)
+                    res = _send_once(pw, chat_url, chat_name, body, marker, headless, creds)
             except PWTimeout:
                 res = {**base, "code": NETWORK, "error": "Teams tardó demasiado en responder."}
             except PWError as e:
@@ -638,7 +748,8 @@ def send_message(chat_url: str, chat_name: str, lines, marker: str = None, headl
                 break
             # Sesion caducada, destino equivocado o sin permiso: reintentar no sirve
             # NOT_DELIVERED tampoco se reintenta: un mensaje pendiente se reenvia solo mas tarde y duplicaria el reporte
-            if res["code"] in (SESSION_EXPIRED, TARGET_NOT_FOUND, WRONG_CHAT, COMPOSER_NOT_FOUND, NO_BROWSER, NOT_DELIVERED):
+            if res["code"] in (SESSION_EXPIRED, TARGET_NOT_FOUND, WRONG_CHAT, COMPOSER_NOT_FOUND, NO_BROWSER, NOT_DELIVERED,
+                               MFA_REQUIRED, BAD_CREDENTIALS):
                 break
             time.sleep(min(5 * attempt, 15))
     log.info("Teams: destino=%s ok=%s verificado=%s código=%s intentos=%s ref=%s",
@@ -649,13 +760,14 @@ def send_message(chat_url: str, chat_name: str, lines, marker: str = None, headl
 # ------------------------------------------------------------------
 # Estado de la sesion (para la interfaz y el aviso de caducidad)
 # ------------------------------------------------------------------
-def session_status(chat_url: str = "", headless: bool = True) -> dict:
+def session_status(chat_url: str = "", headless: bool = True, profile: str = "", creds: dict = None) -> dict:
     """{'state': 'ok'|'expired'|'none'|'busy'|'error', 'message'}  (no escribe nada en Teams)."""
+    set_profile(profile)
     ready, why = playwright_ready()
     if not ready:
         return {"state": "error", "message": why}
-    if not (PROFILE_DIR.exists() and any(PROFILE_DIR.iterdir())):
-        return {"state": "none", "message": "Aún no hay sesión de Teams guardada."}
+    if not (profile_dir().exists() and any(profile_dir().iterdir())):
+        return {"state": "none", "message": "Aún no hay sesión de Teams guardada para esta cuenta: " + login_hint()}
     sync_playwright, PWTimeout, PWError = _import_playwright()
     with profile_lock(wait_s=5) as got:
         if not got:
@@ -668,6 +780,11 @@ def session_status(chat_url: str = "", headless: bool = True) -> dict:
                     page.goto(chat_url if chat_url and valid_chat_url(chat_url) else home_url(chat_url),
                               wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
                     st = _wait_ready(page, NAV_TIMEOUT_MS)
+                    if st == "login" and creds:
+                        ok2, code2, msg2 = _auto_login(page, creds)
+                        if not ok2:
+                            return {"state": "expired", "message": msg2}
+                        st = "ready"
                     if st == "ready":
                         save_cookies(ctx)
                 finally:
@@ -678,5 +795,5 @@ def session_status(chat_url: str = "", headless: bool = True) -> dict:
     if st == "ready":
         return {"state": "ok", "message": "Sesión de Teams activa."}
     if st == "login":
-        return {"state": "expired", "message": "La sesión de Teams caducó: inicia sesión de nuevo con teams_login.py."}
+        return {"state": "expired", "message": "La sesión de Teams caducó: " + login_hint()}
     return {"state": "error", "message": "Teams no terminó de cargar."}

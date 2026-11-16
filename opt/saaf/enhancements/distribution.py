@@ -75,15 +75,15 @@ SESSION_ALERT_EVERY_H = 12
 
 
 def teams_ready(site_id: int) -> tuple:
-    rc = cfgmod.get_site_config(site_id)["report"]
-    if not (rc["teams_chat_url"] or rc["teams_chat_name"]):
-        return False, "Falta el enlace o el nombre del chat/canal de Teams (Campañas → Reportes)."
+    t = cfgmod.effective_teams(site_id)
+    if not (t["chat_url"] or t["chat_name"]):
+        return False, "Falta el enlace o el nombre del chat/canal de Teams (General → Teams o Campañas → Reportes)."
     return teams_browser.playwright_ready()
 
 
 def _notify_session_problem(site_id: int, res: dict):
     """Avisa por correo (como mucho cada 12 h) cuando la sesion de Teams caduco, para que no pase desapercibido."""
-    if res.get("code") != teams_browser.SESSION_EXPIRED:
+    if res.get("code") not in (teams_browser.SESSION_EXPIRED, teams_browser.MFA_REQUIRED, teams_browser.BAD_CREDENTIALS):
         return
     key = f"teams_session_alert:{site_id}"
     try:
@@ -98,9 +98,9 @@ def _notify_session_problem(site_id: int, res: dict):
         sent = False
         for addr in to:
             ok, _ = send_email(addr, "SAAF Pro — la sesión de Teams caducó",
-                               "Los reportes a Microsoft Teams no se están entregando porque la sesión de la cuenta caducó "
-                               "o Microsoft pidió autenticarse de nuevo.\n\nSolución: en el servidor ejecuta\n"
-                               "  venv/bin/python opt/saaf/scripts/python/teams_login.py\ne inicia sesión (con MFA) una vez.")
+                               "Los reportes a Microsoft Teams no se están entregando: " + str(res.get("error", "")) +
+                               "\n\nSolución: en el servidor ejecuta\n  " + teams_browser.login_hint() +
+                               "\ne inicia sesión (con MFA) una vez, o revisa las credenciales en General → Teams.")
             sent = sent or ok
         if sent:
             from datetime import datetime, timezone
@@ -110,19 +110,20 @@ def _notify_session_problem(site_id: int, res: dict):
 
 
 def _teams_result(res: dict, rc: dict) -> dict:
-    return {"channel": "teams", "target": rc.get("teams_chat_name") or "chat de Teams", "ok": bool(res.get("ok")),
+    return {"channel": "teams", "target": rc.get("chat_name") or rc.get("teams_chat_name") or "chat de Teams", "ok": bool(res.get("ok")),
             "verified": bool(res.get("verified")), "code": res.get("code"), "error": res.get("error", ""),
             "marker": res.get("marker"), "proof": res.get("proof", ""), "attempts": res.get("attempts", 0)}
 
 
 def test_teams(site_id: int, progress=None) -> dict:
     """Envia un mensaje de prueba REAL al chat y verifica que aparece. Devuelve el resultado completo."""
-    rc = cfgmod.get_site_config(site_id)["report"]
+    rc = cfgmod.effective_teams(site_id)
     marker = teams_browser.new_marker("SAAF-PRUEBA")
     res = teams_browser.send_message(
-        rc["teams_chat_url"], rc["teams_chat_name"],
+        rc["chat_url"], rc["chat_name"],
         ["✅ SAAF Pro — prueba de conexión con Teams",
-         "Si ves este mensaje, los reportes de esta campaña llegarán a este chat."], marker=marker, progress=progress)
+         "Si ves este mensaje, los reportes de esta campaña llegarán a este chat."], marker=marker, progress=progress, profile=rc["profile"],
+        creds=cfgmod.get_teams_credentials(rc["profile"]))
     _notify_session_problem(site_id, res)
     return _teams_result(res, rc)
 
@@ -143,12 +144,14 @@ def dispatch(site_id: int, report: dict, force: bool = False) -> list:
     if cfg["teams_enabled"]:
         ok_t, why = teams_ready(site_id)
         if not ok_t:
-            results.append({"channel": "teams", "target": cfg.get("teams_chat_name") or "chat de Teams", "ok": False,
+            results.append({"channel": "teams", "target": cfgmod.effective_teams(site_id)["chat_name"] or "chat de Teams", "ok": False,
                             "verified": False, "code": "CONFIG", "error": why})
         else:
-            res = teams_browser.send_message(cfg["teams_chat_url"], cfg["teams_chat_name"], reporting.teams_lines(report))
+            tgt = cfgmod.effective_teams(site_id)
+            res = teams_browser.send_message(tgt["chat_url"], tgt["chat_name"], reporting.teams_lines(report),
+                                             profile=tgt["profile"], creds=cfgmod.get_teams_credentials(tgt["profile"]))
             _notify_session_problem(site_id, res)
-            results.append(_teams_result(res, cfg))
+            results.append(_teams_result(res, tgt))
     if cfg["email_enabled"] and cfg["emails"]:
         subj, text, html = reporting.subject(report), reporting.render_text(report), reporting.render_html(report)
         for to in cfg["emails"]:

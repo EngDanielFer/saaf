@@ -487,9 +487,14 @@ def _tab_campaigns(sites):
         with st.form(f"enh_f_rep_{sid}"):
             teams_on = st.checkbox("Enviar a Microsoft Teams (cuenta de usuario con sesión iniciada, sin webhook)",
                                    value=rc["teams_enabled"])
+            use_glob = st.checkbox("Usar el chat y la cuenta comunes (General → Teams)", value=rc["teams_use_global"],
+                                   help="Si está marcado, se ignoran el enlace, nombre y cuenta de abajo.")
             t_url = st.text_input("Enlace del chat o canal de Teams",
                                   value=rc["teams_chat_url"], placeholder="https://teams.microsoft.com/l/chat/…",
                                   help="En Teams: clic derecho sobre el chat/canal → «Copiar vínculo».")
+            t_prof = st.text_input("Cuenta de Teams (perfil)", value=rc["teams_profile"], placeholder="vacío = por defecto",
+                                   help="Para usar cuentas distintas (p. ej. «personal» y «trabajo») sin que se mezclen sus sesiones. "
+                                        "Cada nombre necesita su propio login:  teams_login.py --profile NOMBRE --chat-url …")
             t_name = st.text_input("Nombre del chat o canal (control de seguridad)", value=rc["teams_chat_name"],
                                    help="Si se indica, solo se envía cuando el chat abierto tiene este nombre. "
                                         "Sin enlace, se busca el chat por este nombre en la lista de Teams.")
@@ -509,7 +514,7 @@ def _tab_campaigns(sites):
                 bad = cfgmod.invalid_emails(emails)
                 if bad:
                     st.error("Correos con formato inválido: " + ", ".join(bad))
-                elif teams_on and not (t_url.strip() or t_name.strip()):
+                elif teams_on and not use_glob and not (t_url.strip() or t_name.strip()):
                     st.error("Indica el enlace o el nombre del chat/canal de Teams.")
                 elif t_url.strip() and not teams_browser.valid_chat_url(t_url):
                     st.error("El enlace debe ser de Teams (https://teams.microsoft.com/…).")
@@ -518,7 +523,7 @@ def _tab_campaigns(sites):
                 else:
                     h, m = _time_to_hm(rtm)
                     cfgmod.set_site_config(sid, {"report": {
-                        "teams_enabled": teams_on, "teams_chat_url": t_url.strip(), "teams_chat_name": t_name.strip(),
+                        "teams_enabled": teams_on, "teams_use_global": use_glob, "teams_chat_url": t_url.strip(), "teams_chat_name": t_name.strip(), "teams_profile": t_prof.strip(),
                         "email_enabled": mail_on, "emails": cfgmod.parse_emails(emails),
                         "mode": rmode, "days": rdays or ["mon"], "hour": h, "minute": m, "only_if_important": only_imp}})
                     _flash("success", "Configuración de reportes guardada.")
@@ -563,10 +568,11 @@ def _tab_campaigns(sites):
         with st.expander("🔐 Sesión de Teams (cuenta que publica los reportes)"):
             st.caption("Los reportes se publican con una cuenta normal de Teams que tenga permiso para escribir en el chat. "
                        "La sesión se inicia UNA vez, a mano y con MFA, en el servidor:  "
-                       "`venv/bin/python opt/saaf/scripts/python/teams_login.py`. SAAF no guarda la contraseña ni evita el MFA.")
+                       "`venv/bin/python opt/saaf/scripts/python/teams_login.py`. La contraseña solo se guarda si la registras en General → Teams; SAAF nunca evita el MFA.")
             if st.button("Comprobar sesión de Teams", key=f"enh_ts_{sid}"):
                 with st.spinner("Comprobando…"):
-                    ss = teams_browser.session_status(rc['teams_chat_url'])
+                    et = cfgmod.effective_teams(sid)
+                    ss = teams_browser.session_status(et['chat_url'], profile=et['profile'], creds=cfgmod.get_teams_credentials(et['profile']))
                 {"ok": st.success, "expired": st.error, "none": st.warning}.get(ss["state"], st.info)(ss["message"])
 
     # ---------------- IA
@@ -648,6 +654,64 @@ def _tab_campaigns(sites):
 # =============================================================
 # General
 # =============================================================
+def _teams_global_section(g, sites):
+    st.markdown("#### 💬 Teams: chat y cuenta comunes")
+    st.caption("Un solo chat de Teams para todas las campañas que marquen «Usar el chat común». "
+               "El reporte se envía solo, al terminar cada auditoría, si la campaña tiene el envío a Teams activado "
+               "y «Después de cada auditoría».")
+    with st.form("enh_f_teams_global"):
+        gu = st.text_input("Enlace del chat o canal común", value=g["teams_chat_url"],
+                           placeholder="https://teams.microsoft.com/l/chat/…  (Teams: clic derecho → Copiar vínculo)")
+        gn = st.text_input("Nombre del chat (control de seguridad)", value=g["teams_chat_name"])
+        gp = st.text_input("Cuenta de Teams (perfil)", value=g["teams_profile"], placeholder="vacío = por defecto",
+                           help="Debe coincidir con el --profile usado en teams_login.py.")
+        has_c = cfgmod.get_teams_credentials(gp) is not None
+        st.markdown("**Credenciales de esa cuenta** (opcional: para volver a iniciar sesión solas si la sesión caduca)")
+        cu = st.text_input("Usuario (correo de Microsoft)", value=cfgmod.teams_credentials_user(gp) or "")
+        cp = st.text_input("Contraseña", type="password", placeholder="•••••••• guardada (déjala vacía para conservarla)" if has_c else "")
+        enc = secrets_store.encryption_available()
+        st.caption(("🔒 Se guardan cifradas." if enc else "⚠️ Se guardan en config/enh_secrets.json (permisos 600), SIN cifrar: "
+                    "define SAAF_SECRET_KEY e instala `cryptography` para cifrarlas.")
+                   + " Usa una cuenta dedicada al bot. Si la cuenta tiene MFA, Microsoft pedirá la verificación y no se podrá "
+                     "automatizar: en ese caso inicia sesión a mano con teams_login.py (la sesión dura semanas).")
+        c1, c2 = st.columns(2)
+        save = c1.form_submit_button("Guardar chat y cuenta comunes")
+        drop = c2.form_submit_button("Eliminar credenciales guardadas")
+    if save:
+        if gu.strip() and not teams_browser.valid_chat_url(gu):
+            st.error("El enlace debe ser de Teams (https://teams.microsoft.com/… o https://teams.live.com/…).")
+        elif cu.strip() and not (cp or has_c):
+            st.error("Escribe también la contraseña.")
+        else:
+            cfgmod.set_global(teams_chat_url=gu.strip(), teams_chat_name=gn.strip(), teams_profile=gp.strip())
+            gp_norm = cfgmod.get_global()["teams_profile"]
+            if cu.strip() and cp:
+                cfgmod.set_teams_credentials(gp_norm, cu.strip(), cp)
+            elif cu.strip() and has_c:
+                old = cfgmod.get_teams_credentials(gp_norm)
+                cfgmod.set_teams_credentials(gp_norm, cu.strip(), old["password"])
+            _flash("success", "Chat y cuenta de Teams comunes guardados.")
+            st.rerun()
+    if drop:
+        cfgmod.clear_teams_credentials(gp)
+        _flash("success", "Credenciales de Teams eliminadas.")
+        st.rerun()
+    b1, b2 = st.columns(2)
+    if b1.button("Usar este chat en TODAS las campañas", key="enh_teams_all",
+                 help="Activa el envío a Teams y «usar el chat común» en cada campaña. El resto de su configuración no cambia."):
+        if not (g["teams_chat_url"] or g["teams_chat_name"]):
+            st.error("Primero guarda el enlace o el nombre del chat común.")
+        else:
+            n = cfgmod.use_global_teams_everywhere([x["id"] for x in sites])
+            _flash("success", f"{n} campaña(s) ahora envían su reporte al chat común de Teams.")
+            st.rerun()
+    if b2.button("Comprobar sesión de la cuenta común", key="enh_teams_gsess"):
+        with st.spinner("Comprobando…"):
+            ss = teams_browser.session_status(g["teams_chat_url"], profile=g["teams_profile"],
+                                              creds=cfgmod.get_teams_credentials(g["teams_profile"]))
+        {"ok": st.success, "expired": st.error, "none": st.warning}.get(ss["state"], st.info)(ss["message"])
+
+
 def _tab_general(sites):
     g = cfgmod.get_global()
     st.caption("La confianza de la IA nunca autoriza por sí sola una acción destructiva: el umbral solo decide "
@@ -677,6 +741,8 @@ def _tab_general(sites):
         st.caption("El correo o SMS de una amenaza nueva lo envía el sistema original antes de este análisis, "
                    "así que esa primera notificación se manda igual. El efecto se ve en la pantalla desde ese "
                    "momento, y en las notificaciones de las auditorías siguientes.")
+
+    _teams_global_section(g, sites)
 
     st.markdown("#### Estado del entorno")
     try:
